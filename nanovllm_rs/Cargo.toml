@@ -8,6 +8,8 @@ candle-core = "0.8"
 candle-nn = "0.8"
 cudarc = { version = "0.19.8", features = ["nccl"] }
 half = "2"
+pyo3 = { version = "0.23", features = ["auto-initialize"] }
+numpy = "0.23"
 
 [features]
 cuda = ["candle-core/cuda"]
