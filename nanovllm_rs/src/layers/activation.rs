@@ -4,7 +4,7 @@ pub struct SiluAndMul;
 
 impl SiluAndMul {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // last dim 6144
+        // last dim 6144 (for qwen 0.6B)
         let last_dim = x.dim(D::Minus1)?;
         // half dim: 3072
         let half = last_dim / 2;
