@@ -16,6 +16,15 @@ pub struct Config {
     #[serde(default)]
     pub max_model_len: usize,
     pub eos_token_id: u32,
+    pub hidden_act: String,
+    #[serde(default = "default_attention_bias")]
+    pub attention_bias: bool,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+}
+
+fn default_attention_bias() -> bool {
+    true
 }
 
 impl Config {
@@ -42,6 +51,9 @@ impl Config {
             max_position_embeddings: 40960,
             max_model_len: 40960,
             eos_token_id: 151645,
+            hidden_act: "silu".to_string(),
+            attention_bias: false,
+            tie_word_embeddings: true,
         }
     }
 }

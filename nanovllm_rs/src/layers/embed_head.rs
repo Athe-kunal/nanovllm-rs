@@ -44,7 +44,7 @@ impl VocabParallelEmbedding{
         Ok(())
     }
 
-    pub fn forward(self, x: &Tensor) -> Result<Tensor>{
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor>{
         if self.tp_size == 1 {
             return Embedding::new(self.weight.clone(),self.embedding_dim).forward(x);
         }
@@ -76,7 +76,12 @@ impl ParallelLMHead {
             bias: None,
         })
     }
-    pub fn forward(self, x: &Tensor, cu_seqlens_q: &Tensor, seq_need_compute_logits: &[u32]) -> Result<Tensor> {
+
+    /// Equivalent of `self.lm_head.weight.data = self.model.embed_tokens.weight.data`.
+    pub fn tie_weights(&mut self, embed_tokens: &VocabParallelEmbedding) {
+        self.base.weight = embed_tokens.weight.clone();
+    }
+    pub fn forward(&self, x: &Tensor, cu_seqlens_q: &Tensor, seq_need_compute_logits: &[u32]) -> Result<Tensor> {
         let len = cu_seqlens_q.dim(0)?;
         let sliced: Vec<u32> = cu_seqlens_q.narrow(0, 1, len-1)?.to_vec1()?;
         let mut last_indices: Vec<u32> = sliced.iter().map(|v| v - 1).collect();

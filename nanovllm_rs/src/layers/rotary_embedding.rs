@@ -26,7 +26,7 @@ pub fn apply_rotary_emb(
 }
 
 impl RotaryEmbedding{
-    fn new(head_size: usize, rotary_dim: usize, max_position_embeddings: usize, base:f32, device: &Device) -> Result<Self>{
+    pub fn new(head_size: usize, rotary_dim: usize, max_position_embeddings: usize, base:f32, device: &Device) -> Result<Self>{
         assert_eq!(head_size,rotary_dim);
         // torch: 1.0 / (base ** (arange(0, rotary_dim, 2).float() / rotary_dim))
         let exponent = (Tensor::arange_step(0u32, rotary_dim as u32, 2u32, device)?

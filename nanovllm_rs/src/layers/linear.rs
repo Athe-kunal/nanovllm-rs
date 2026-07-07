@@ -144,6 +144,10 @@ impl MergedColumnParallelLinear {
         self.base.base.weight = Tensor::cat(&[&before, &loaded_weight, &after], tp_dim)?;
         Ok(())
     }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.base.forward(x)
+    }
 }
 
 pub struct RowParallelLinear{
@@ -235,6 +239,10 @@ impl QKVParallelLinear{
         let output_size = (total_num_heads + 2 * total_num_kv_heads) * head_size;
         let base = ColumnParallelLinear::new(hidden_size, output_size, bias, comm, device)?;
         Ok(Self { base, head_size, num_heads, num_kv_heads })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.base.forward(x)
     }
 
     pub fn weight_loader(&mut self, loaded_weight: Tensor, loaded_shard_id: &str) -> Result<()> {
