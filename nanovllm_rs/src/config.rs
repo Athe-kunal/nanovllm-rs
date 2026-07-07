@@ -1,3 +1,7 @@
+use serde::Deserialize;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -8,11 +12,21 @@ pub struct Config {
     pub vocab_size: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
+    pub max_position_embeddings: usize,
+    #[serde(default)]
     pub max_model_len: usize,
     pub eos_token_id: u32,
 }
 
 impl Config {
+    /// Equivalent of `transformers.Qwen3Config.from_pretrained(model_path)`:
+    /// reads `config.json` from the model directory.
+    pub fn from_pretrained<P: AsRef<Path>>(model_path: P) -> candle_core::Result<Self> {
+        let config_path = model_path.as_ref().join("config.json");
+        let file = std::fs::File::open(&config_path).map_err(candle_core::Error::wrap)?;
+        serde_json::from_reader(file).map_err(candle_core::Error::wrap)
+    }
+
     // Qwen3-0.6B, hardcoded — fill in with your actual model's values
     pub fn qwen3_0_6b() -> Self {
         Self {
@@ -25,6 +39,7 @@ impl Config {
             vocab_size: 151936,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
+            max_position_embeddings: 40960,
             max_model_len: 40960,
             eos_token_id: 151645,
         }

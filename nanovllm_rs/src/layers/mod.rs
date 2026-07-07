@@ -5,3 +5,4 @@ pub mod sampler;
 pub mod rotary_embedding;
 pub mod embed_head;
 pub mod dist_util;
+pub mod linear;
