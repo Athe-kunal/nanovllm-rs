@@ -1,5 +1,5 @@
 use candle_core::Tensor;
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 
 #[derive(Clone, Default)]
 pub struct Context{
@@ -13,13 +13,15 @@ pub struct Context{
     pub seq_need_compute_logits: Option<Tensor>
 }
 
-fn context_lock() -> &'static Mutex<Context> {
-    static CONTEXT: OnceLock<Mutex<Context>> = OnceLock::new();
-    CONTEXT.get_or_init(|| Mutex::new(Context::default()))
+thread_local! {
+    // Under tensor parallelism each rank runs its own OS thread with its own CUDA device;
+    // a process-global context would let rank threads race and hand each other tensors
+    // from the wrong GPU (see the "device mismatch" bug this replaced).
+    static CONTEXT: RefCell<Context> = RefCell::new(Context::default());
 }
 
 pub fn get_context() -> Context {
-    context_lock().lock().unwrap().clone()
+    CONTEXT.with(|ctx| ctx.borrow().clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33,20 +35,20 @@ pub fn set_context(
     block_tables: Option<Tensor>,
     seq_need_compute_logits: Option<Tensor>,
 ) {
-    let mut ctx = context_lock().lock().unwrap();
-    *ctx = Context {
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        slot_mapping,
-        context_lens,
-        block_tables,
-        seq_need_compute_logits,
-    };
+    CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = Context {
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            context_lens,
+            block_tables,
+            seq_need_compute_logits,
+        };
+    });
 }
 
 pub fn reset_context() {
-    let mut ctx = context_lock().lock().unwrap();
-    *ctx = Context::default();
+    CONTEXT.with(|ctx| *ctx.borrow_mut() = Context::default());
 }
