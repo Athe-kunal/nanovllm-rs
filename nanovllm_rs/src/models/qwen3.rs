@@ -49,6 +49,7 @@ impl Qwen3Attention{
         rms_norm_eps: f32,
         qkv_bias: bool,
         rope_theta: f32,
+        dtype: DType,
         comm: Option<Arc<Comm>>,
         device: &Device,
     ) -> Result<Self> {
@@ -76,6 +77,7 @@ impl Qwen3Attention{
             total_num_heads,
             Some(total_num_kv_heads),
             qkv_bias,
+            dtype,
             comm.clone(),
             device,
         )?;
@@ -83,6 +85,7 @@ impl Qwen3Attention{
             total_num_heads * head_dim,
             hidden_size,
             false,
+            dtype,
             comm,
             device,
         )?;
@@ -155,6 +158,7 @@ impl Qwen3MLP{
         hidden_size: usize,
         intermediate_size: usize,
         hidden_act: &str,
+        dtype: DType,
         comm: Option<Arc<Comm>>,
         device: &Device,
     ) -> Result<Self> {
@@ -162,10 +166,11 @@ impl Qwen3MLP{
             hidden_size,
             vec![intermediate_size; 2],
             false,
+            dtype,
             comm.clone(),
             device,
         )?;
-        let down_proj = RowParallelLinear::new(intermediate_size, hidden_size, false, comm, device)?;
+        let down_proj = RowParallelLinear::new(intermediate_size, hidden_size, false, dtype, comm, device)?;
         assert_eq!(hidden_act, "silu");
         let act_fn = SiluAndMul;
 
@@ -197,6 +202,7 @@ impl Qwen3DecoderLayer{
             config.rms_norm_eps as f32,
             config.attention_bias,
             config.rope_theta as f32,
+            config.dtype(),
             comm.clone(),
             device,
         )?;
@@ -204,6 +210,7 @@ impl Qwen3DecoderLayer{
             config.hidden_size,
             config.intermediate_size,
             &config.hidden_act,
+            config.dtype(),
             comm,
             device,
         )?;
@@ -254,6 +261,7 @@ impl Qwen3Model{
             config.hidden_size,
             tp_rank,
             tp_size,
+            config.dtype(),
             comm.clone(),
             device,
         )?;
@@ -310,6 +318,7 @@ impl Qwen3ForCausalLM{
             false,
             tp_rank,
             tp_size,
+            config.dtype(),
             comm,
             device,
         )?;

@@ -22,18 +22,6 @@ fn dtype_itemsize(dtype: &str) -> usize {
     }
 }
 
-fn candle_dtype_for(dtype: &str) -> DType {
-    match dtype {
-        "float32" => DType::F32,
-        "float64" => DType::F64,
-        "float16" => DType::F16,
-        "bfloat16" => DType::BF16,
-        "int64" => DType::I64,
-        "uint8" => DType::U8,
-        other => panic!("unsupported torch_dtype: {other}"),
-    }
-}
-
 pub struct ModelRunner {
     config: Config,
     engine_config: EngineConfig,
@@ -51,7 +39,7 @@ impl ModelRunner {
         Python::with_gil(|py| pybridge::set_cuda_device(py, rank)).expect("failed to set cuda device");
         let device = Device::cuda_if_available(rank).expect("failed to create device");
         let mut model = Qwen3ForCausalLM::new(config, comm, &device).expect("failed to build model");
-        loader::load_model(&mut model, &engine_config.model_path).expect("failed to load model weights");
+        loader::load_model(&mut model, &engine_config.model_path, &device).expect("failed to load model weights");
         model.tie_weights_if_configured();
 
         let mut runner = Self {
@@ -232,6 +220,7 @@ impl ModelRunner {
         let seq_need_compute_logits: Vec<usize> = context
             .seq_need_compute_logits
             .as_ref()
+            .filter(|t| t.elem_count() > 0)
             .map(|t| t.to_dtype(DType::U32).and_then(|t| t.to_vec1::<u32>()))
             .transpose()
             .expect("failed to extract seq_need_compute_logits")
@@ -257,18 +246,21 @@ impl ModelRunner {
         let num_seqs = (max_num_batched_tokens / max_model_len)
             .min(self.engine_config.max_num_seqs)
             .max(1);
+        // Never exceeds max_num_batched_tokens: that's the real ceiling on a single
+        // step's token count, so a real request can't hit a length the profiling run didn't.
+        let seq_len = max_model_len.min(max_num_batched_tokens);
 
         let mut seqs: Vec<Sequence> = (0..num_seqs)
             .map(|_| {
                 Sequence::with_block_size(
-                    vec![0u32; max_model_len],
+                    vec![0u32; seq_len],
                     SamplingParams::default(),
                     self.engine_config.kvcache_block_size,
                 )
             })
             .collect();
         for seq in seqs.iter_mut() {
-            seq.num_new_tokens = max_model_len;
+            seq.num_new_tokens = seq_len;
         }
 
         let _ = self.run(&mut seqs);
@@ -319,7 +311,7 @@ impl ModelRunner {
                 self.engine_config.kvcache_block_size,
                 num_kv_heads,
                 head_dim,
-                candle_dtype_for(&self.config.torch_dtype),
+                self.config.dtype(),
             )
         })
         .expect("failed to allocate kv cache");

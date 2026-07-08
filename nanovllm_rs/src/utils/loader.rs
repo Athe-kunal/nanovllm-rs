@@ -24,7 +24,7 @@ pub trait ModelWeights {
     fn load_weight(&mut self, param_name: &str, loaded_weight: Tensor, shard_id: Option<ShardId>) -> Result<()>;
 }
 
-pub fn load_model<M: ModelWeights>(model: &mut M, path: &str) -> Result<()> {
+pub fn load_model<M: ModelWeights>(model: &mut M, path: &str, device: &Device) -> Result<()> {
     let packed_modules_mapping = model.packed_modules_mapping();
 
     let entries = std::fs::read_dir(path).map_err(candle_core::Error::wrap)?;
@@ -38,6 +38,7 @@ pub fn load_model<M: ModelWeights>(model: &mut M, path: &str) -> Result<()> {
         let tensors: HashMap<String, Tensor> = safetensors::load(&file_path, &Device::Cpu)?;
 
         for (weight_name, loaded_weight) in tensors {
+            let loaded_weight = loaded_weight.to_device(device)?;
             let mut matched = false;
 
             for (k, (v, shard_id)) in packed_modules_mapping.iter() {

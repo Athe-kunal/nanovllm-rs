@@ -17,12 +17,12 @@ pub struct VocabParallelEmbedding {
 }
 
 impl VocabParallelEmbedding{
-    pub fn new(num_embeddings: usize, embedding_dim: usize, tp_rank: usize, tp_size: usize, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
+    pub fn new(num_embeddings: usize, embedding_dim: usize, tp_rank: usize, tp_size: usize, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
         assert_eq!(num_embeddings % tp_size,0, "num_embeddings should be divisible by tp_size");
         assert!(tp_size == 1 || comm.is_some(), "comm is required when tp_size > 1");
 
         let num_embeddings_per_partition = num_embeddings / tp_size;
-        let weight = Tensor::zeros((num_embeddings_per_partition,embedding_dim), DType::F32, device)?;
+        let weight = Tensor::zeros((num_embeddings_per_partition,embedding_dim), dtype, device)?;
         let vocab_start_idx = num_embeddings_per_partition * tp_rank;
         let vocab_end_idx = vocab_start_idx + num_embeddings_per_partition;
 
@@ -66,10 +66,10 @@ pub struct ParallelLMHead {
 }
 
 impl ParallelLMHead {
-    pub fn new(num_embeddings: usize, embedding_dim: usize, bias: bool, tp_rank: usize, tp_size: usize, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(num_embeddings: usize, embedding_dim: usize, bias: bool, tp_rank: usize, tp_size: usize, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         assert!(!bias, "bias is not supported");
 
-        let base = VocabParallelEmbedding::new(num_embeddings, embedding_dim, tp_rank, tp_size, comm, device)?;
+        let base = VocabParallelEmbedding::new(num_embeddings, embedding_dim, tp_rank, tp_size, dtype, comm, device)?;
 
         Ok(Self {
             base,
@@ -94,12 +94,16 @@ impl ParallelLMHead {
             .expect("cu_seqlens_q must be set via set_context before calling ParallelLMHead::forward");
 
         let len = cu_seqlens_q.dim(0)?;
-        let sliced: Vec<u32> = cu_seqlens_q.narrow(0, 1, len-1)?.to_vec1()?;
+        let sliced: Vec<u32> = cu_seqlens_q.narrow(0, 1, len-1)?.to_dtype(candle_core::DType::U32)?.to_vec1()?;
         let mut last_indices: Vec<u32> = sliced.iter().map(|v| v - 1).collect();
 
+        // A zero-element CUDA tensor's to_dtype/to_vec1 issue a zero-size cuMemcpy, which the
+        // driver rejects as CUDA_ERROR_INVALID_VALUE — skip the conversion entirely when empty
+        // (happens during warmup, where no sequence yet has a populated block_table).
         if let Some(seq_need_compute_logits) = context.seq_need_compute_logits.as_ref() {
-            let seq_need_compute_logits: Vec<u32> = seq_need_compute_logits.to_dtype(candle_core::DType::U32)?.to_vec1()?;
-            if !seq_need_compute_logits.is_empty() {
+            if seq_need_compute_logits.elem_count() > 0 {
+                let seq_need_compute_logits: Vec<u32> =
+                    seq_need_compute_logits.to_dtype(candle_core::DType::U32)?.to_vec1()?;
                 last_indices = seq_need_compute_logits.iter().map(|&i| last_indices[i as usize]).collect();
             }
         }

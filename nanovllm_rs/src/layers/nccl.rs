@@ -39,7 +39,7 @@ impl Comm {
         let mut comm = std::mem::MaybeUninit::uninit();
         let comm = unsafe {
             result::comm_init_rank(comm.as_mut_ptr(), world_size as i32, id, rank as i32)
-                .map_err(|e| candle_core::Error::Msg(format!("nccl comm_init_rank failed: {e:?}")))?;
+                .map_err(|e| candle_core::Error::Msg(format!("nccl comm_init_rank failed: {:?}", e.0)))?;
             comm.assume_init()
         };
         Ok(Self { comm, rank, world_size })

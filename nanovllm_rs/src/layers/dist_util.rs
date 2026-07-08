@@ -48,6 +48,10 @@ impl CustomOp1 for AllReduce {
     fn cuda_fwd(&self, s: &candle_core::CudaStorage, l: &Layout) -> Result<(candle_core::CudaStorage, Shape)> {
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
+        // Unlike every other candle CUDA op, this raw NCCL call bypasses candle's own launch
+        // path (which always rebinds the context before a kernel), so without this the thread's
+        // current CUDA context can be left pointing at a different rank's device.
+        dev.cuda_device().bind_to_thread().map_err(candle_core::Error::wrap)?;
         let dtype = nccl_dtype(s.dtype())?;
         let stream = cuda_stream(&dev);
 
@@ -99,6 +103,7 @@ impl CustomOp1 for AllGather {
         let world_size = self.comm.world_size();
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
+        dev.cuda_device().bind_to_thread().map_err(candle_core::Error::wrap)?;
         let dtype = nccl_dtype(s.dtype())?;
         let stream = cuda_stream(&dev);
 

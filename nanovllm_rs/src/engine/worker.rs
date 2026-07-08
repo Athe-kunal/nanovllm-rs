@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
+use candle_core::Device;
 use cudarc::nccl::sys::ncclUniqueId;
 
 use crate::config::{Config, EngineConfig};
@@ -50,6 +51,10 @@ fn spawn_worker(
     let (tx, rx) = mpsc::channel::<Command>();
 
     let thread = std::thread::spawn(move || {
+        // Binds this thread's CUDA context to `rank`'s device before NCCL captures it via
+        // cudaGetDevice() — otherwise every fresh thread defaults to device 0 and NCCL sees
+        // every rank claiming the same GPU ("Duplicate GPU detected").
+        Device::cuda_if_available(rank).expect("failed to create device");
         let comm = Comm::init_rank(rank, world_size, id).expect("nccl comm_init_rank failed");
         let mut runner = ModelRunner::new(&config, &engine_config, rank, Some(Arc::new(comm)));
         probe_tx.send(runner.probe_num_kvcache_blocks()).expect("coordinator dropped");
@@ -84,6 +89,7 @@ pub fn init_tensor_parallel(config: &Config, engine_config: &EngineConfig) -> (M
         .collect();
     drop(probe_tx);
 
+    Device::cuda_if_available(0).expect("failed to create device");
     let comm0 = Comm::init_rank(0, world_size, id).expect("nccl comm_init_rank failed");
     let mut model_runner = ModelRunner::new(config, engine_config, 0, Some(Arc::new(comm0)));
 

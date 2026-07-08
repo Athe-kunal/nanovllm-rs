@@ -21,15 +21,15 @@ pub struct LinearBase{
 }
 
 impl LinearBase{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, tp_dim: Option<usize>, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
+    pub fn new(input_size: usize, output_size: usize, bias: bool, tp_dim: Option<usize>, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
         let (tp_rank, tp_size) = match &comm {
             Some(comm) => (comm.rank(), comm.world_size()),
             None => (0, 1),
         };
 
-        let weight = Tensor::zeros((output_size, input_size), DType::F32, device)?;
+        let weight = Tensor::zeros((output_size, input_size), dtype, device)?;
         let bias = if bias {
-            Some(Tensor::zeros(output_size, DType::F32, device)?)
+            Some(Tensor::zeros(output_size, dtype, device)?)
         } else {
             None
         };
@@ -61,8 +61,8 @@ pub struct ReplicatedLinear{
 }
 
 impl ReplicatedLinear{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
-        let base = LinearBase::new(input_size, output_size, bias, None, comm, device)?;
+    pub fn new(input_size: usize, output_size: usize, bias: bool, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
+        let base = LinearBase::new(input_size, output_size, bias, None, dtype, comm, device)?;
         Ok(Self { base })
     }
 
@@ -80,7 +80,7 @@ pub struct ColumnParallelLinear{
 }
 
 impl ColumnParallelLinear{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(input_size: usize, output_size: usize, bias: bool, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let (tp_rank, tp_size) = match &comm {
             Some(comm) => (comm.rank(), comm.world_size()),
             None => (0, 1),
@@ -89,7 +89,7 @@ impl ColumnParallelLinear{
         // gets a slice of *output/hidden features*, computed for every token — the sequence/
         // batch dims are never split, only the model's hidden dimension is.
         let output_size = divide(output_size, tp_size);
-        let base = LinearBase::new(input_size, output_size, bias, Some(0), comm, device)?;
+        let base = LinearBase::new(input_size, output_size, bias, Some(0), dtype, comm, device)?;
         Ok(Self { base })
     }
 
@@ -113,9 +113,9 @@ pub struct MergedColumnParallelLinear{
 }
 
 impl MergedColumnParallelLinear {
-    pub fn new(input_size: usize, output_sizes: Vec<usize>, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
+    pub fn new(input_size: usize, output_sizes: Vec<usize>, bias: bool, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
         let output_size = output_sizes.iter().sum();
-        let base = ColumnParallelLinear::new(input_size, output_size, bias, comm, device)?;
+        let base = ColumnParallelLinear::new(input_size, output_size, bias, dtype, comm, device)?;
         Ok(Self { base, output_sizes })
     }
 
@@ -155,7 +155,7 @@ pub struct RowParallelLinear{
 }
 
 impl RowParallelLinear{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(input_size: usize, output_size: usize, bias: bool, dtype: DType, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let tp_size = match &comm {
             Some(comm) => comm.world_size(),
             None => 1,
@@ -166,7 +166,7 @@ impl RowParallelLinear{
         // (the output of the previous ColumnParallelLinear layer). Like ColumnParallelLinear,
         // this is a hidden-dimension shard, not a sequence/batch shard — every rank still sees
         // every token, just a fraction of that token's feature vector.
-        let base = LinearBase::new(divide(input_size, tp_size), output_size, bias, Some(1), comm, device)?;
+        let base = LinearBase::new(divide(input_size, tp_size), output_size, bias, Some(1), dtype, comm, device)?;
         Ok(Self { base })
     }
 
@@ -176,7 +176,11 @@ impl RowParallelLinear{
         let tp_dim = self.base.tp_dim.expect("RowParallelLinear requires tp_dim");
         let shard_size = self.base.weight.dim(tp_dim)?;
         let start_idx = self.base.tp_rank * shard_size;
-        self.base.weight = loaded_weight.narrow(tp_dim, start_idx, shard_size)?;
+        // narrow along tp_dim=1 (columns) of a row-major matrix is not contiguous (unlike
+        // ColumnParallelLinear's tp_dim=0 row-slice) — candle's matmul requires contiguous
+        // operands, so this stayed hidden at tp_size=1 (full-width narrow is trivially
+        // contiguous) until real sharding at tp_size>1 exposed it.
+        self.base.weight = loaded_weight.narrow(tp_dim, start_idx, shard_size)?.contiguous()?;
         Ok(())
     }
 
@@ -224,6 +228,7 @@ impl QKVParallelLinear{
         total_num_heads: usize,
         total_num_kv_heads: Option<usize>,
         bias: bool,
+        dtype: DType,
         comm: Option<Arc<Comm>>,
         device: &Device,
     ) -> Result<Self> {
@@ -237,7 +242,7 @@ impl QKVParallelLinear{
         // Fused Q+K+V output width: Q gets total_num_heads worth of features, K and V
         // each get total_num_kv_heads worth (see the earlier explanation of the `2 *`).
         let output_size = (total_num_heads + 2 * total_num_kv_heads) * head_size;
-        let base = ColumnParallelLinear::new(hidden_size, output_size, bias, comm, device)?;
+        let base = ColumnParallelLinear::new(hidden_size, output_size, bias, dtype, comm, device)?;
         Ok(Self { base, head_size, num_heads, num_kv_heads })
     }
 

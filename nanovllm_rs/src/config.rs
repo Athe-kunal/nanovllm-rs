@@ -1,3 +1,4 @@
+use candle_core::DType;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -39,7 +40,25 @@ impl Config {
     pub fn from_pretrained<P: AsRef<Path>>(model_path: P) -> candle_core::Result<Self> {
         let config_path = model_path.as_ref().join("config.json");
         let file = std::fs::File::open(&config_path).map_err(candle_core::Error::wrap)?;
-        serde_json::from_reader(file).map_err(candle_core::Error::wrap)
+        let mut config: Self = serde_json::from_reader(file).map_err(candle_core::Error::wrap)?;
+        // HF config.json has no `max_model_len` key (that's a vllm-ism); fall back to the
+        // model's trained context length, same as vllm does when it isn't overridden.
+        if config.max_model_len == 0 {
+            config.max_model_len = config.max_position_embeddings;
+        }
+        Ok(config)
+    }
+
+    pub fn dtype(&self) -> DType {
+        match self.torch_dtype.as_str() {
+            "float32" => DType::F32,
+            "float64" => DType::F64,
+            "float16" => DType::F16,
+            "bfloat16" => DType::BF16,
+            "int64" => DType::I64,
+            "uint8" => DType::U8,
+            other => panic!("unsupported torch_dtype: {other}"),
+        }
     }
 
     // Qwen3-0.6B, hardcoded — fill in with your actual model's values

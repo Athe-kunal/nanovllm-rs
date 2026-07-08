@@ -3,9 +3,11 @@ name = "nanovllm_kernels"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "torch",
+    "torch==2.8.0",
+    "numpy",
     "triton",
-    "flash-attn",
+    "huggingface_hub",
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl",
 ]
 
 [build-system]

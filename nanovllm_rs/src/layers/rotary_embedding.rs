@@ -19,8 +19,8 @@ pub fn apply_rotary_emb(
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
 
-    let y1 = (x1.mul(cos)? - x2.mul(sin)?)?;
-    let y2 = (x2.mul(cos)? + x1.mul(sin)?)?;
+    let y1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
+    let y2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
 
     Tensor::cat(&[&y1, &y2], D::Minus1)
 }
@@ -35,7 +35,7 @@ impl RotaryEmbedding{
 
         // base ** exponent == exp(exponent * ln(base))
         let inv_freq = (exponent * (base as f64).ln())?.exp()?.recip()?;
-        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?;
+        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?.to_dtype(DType::F32)?;
         let t = t.unsqueeze(1)?;
         let inv_freq_row = inv_freq.unsqueeze(0)?;
         let freqs = t.broadcast_mul(&inv_freq_row)?;
@@ -57,7 +57,7 @@ impl RotaryEmbedding{
     }
 
     pub fn forward(&self, positions: &Tensor, query: &Tensor, key: &Tensor) -> Result<(Tensor, Tensor)>{
-        let cos_sin = self.cos_sin_cache.index_select(positions, 0)?;
+        let cos_sin = self.cos_sin_cache.index_select(positions, 0)?.to_dtype(query.dtype())?;
         let last_dim = cos_sin.dim(D::Minus1)?;
         let half = last_dim / 2;
         let cos = cos_sin.narrow(D::Minus1, 0, half)?;
