@@ -16,12 +16,14 @@ struct Args {
     model_path: String,
     tensor_parallel_size: usize,
     port: u16,
+    max_num_batched_tokens: Option<usize>,
 }
 
 fn parse_args() -> Args {
     let mut model_path: Option<String> = None;
     let mut tensor_parallel_size = 1usize;
     let mut port = 8000u16;
+    let mut max_num_batched_tokens = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -34,6 +36,11 @@ fn parse_args() -> Args {
                 let value = args.next().expect("--port requires a value");
                 port = value.parse().expect("--port must be a valid port number");
             }
+            "--max-num-batched-tokens" => {
+                let value = args.next().expect("--max-num-batched-tokens requires a value");
+                max_num_batched_tokens =
+                    Some(value.parse().expect("--max-num-batched-tokens must be a positive integer"));
+            }
             "--model" => {
                 model_path = Some(args.next().expect("--model requires a value"));
             }
@@ -45,6 +52,7 @@ fn parse_args() -> Args {
         model_path: model_path.expect("usage: serve <model_path> [--tensor-parallel-size N] [--port P]"),
         tensor_parallel_size,
         port,
+        max_num_batched_tokens,
     }
 }
 
@@ -89,11 +97,14 @@ async fn generate(State(engine): State<SharedEngine>, Json(req): Json<GenerateRe
 async fn main() {
     let args = parse_args();
     let config = Config::from_pretrained(&args.model_path).expect("failed to load model config");
-    let engine_config = EngineConfig {
+    let mut engine_config = EngineConfig {
         model_path: args.model_path,
         tensor_parallel_size: args.tensor_parallel_size,
         ..EngineConfig::default()
     };
+    if let Some(max_num_batched_tokens) = args.max_num_batched_tokens {
+        engine_config.max_num_batched_tokens = max_num_batched_tokens;
+    }
 
     let engine: SharedEngine = Arc::new(Mutex::new(LLMEngine::new(config, engine_config)));
     let app = Router::new().route("/generate", post(generate)).with_state(engine);
