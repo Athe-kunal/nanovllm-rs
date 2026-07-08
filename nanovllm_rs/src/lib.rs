@@ -3,4 +3,4 @@ pub mod engine;
 mod layers;
 mod models;
 pub mod sampling_params;
-mod utils;
+pub mod utils;

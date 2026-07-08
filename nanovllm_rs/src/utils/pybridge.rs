@@ -26,12 +26,25 @@ pub fn kernels_module(py: Python<'_>) -> Result<Bound<'_, PyModule>> {
     Ok(m)
 }
 
-/// Converts a candle `Tensor` into a CUDA `torch.Tensor`, preserving its dtype and shape.
-pub fn tensor_to_torch(py: Python<'_>, t: &Tensor) -> Result<Py<PyAny>> {
+// The candle<->torch tensor bridge is deliberately split into a candle half (host copy,
+// no GIL) and a Python half (GIL held). Under tensor parallelism a candle device->host or
+// host->device copy syncs the candle CUDA stream, which may be blocked on a pending
+// cross-rank NCCL collective (see layers/dist_util.rs). If the GIL is held across that
+// sync, the peer rank cannot acquire the GIL to launch its half of the collective, the
+// collective never completes, the stream never drains, and both ranks deadlock. Keeping the
+// candle copies out of `Python::with_gil` is what makes TP > 1 able to make progress.
+
+/// Copies a candle `Tensor` to host f32 data (with its dims and original dtype). Pure candle
+/// device->host work — call this WITHOUT the GIL held (see the note above).
+pub fn tensor_to_host(t: &Tensor) -> Result<(Vec<f32>, Vec<i64>, DType)> {
     let dtype = t.dtype();
     let dims: Vec<i64> = t.dims().iter().map(|&d| d as i64).collect();
     let data: Vec<f32> = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    Ok((data, dims, dtype))
+}
 
+/// Builds a CUDA `torch.Tensor` from host f32 data, preserving dtype and shape (GIL held).
+pub fn host_to_torch(py: Python<'_>, data: Vec<f32>, dims: Vec<i64>, dtype: DType) -> Result<Py<PyAny>> {
     let kernels = kernels_module(py)?;
     let arr = PyArray1::from_vec(py, data);
     kernels
@@ -41,12 +54,16 @@ pub fn tensor_to_torch(py: Python<'_>, t: &Tensor) -> Result<Py<PyAny>> {
         .map_err(candle_core::Error::wrap)
 }
 
-/// Converts a candle index `Tensor` (slot_mapping, cu_seqlens, block_tables, ...) into a
-/// CUDA `torch.int32` tensor.
-pub fn index_tensor_to_torch(py: Python<'_>, t: &Tensor) -> Result<Py<PyAny>> {
+/// Copies a candle index `Tensor` (slot_mapping, cu_seqlens, block_tables, ...) to host i64
+/// data. Pure candle device->host work — call this WITHOUT the GIL held.
+pub fn index_tensor_to_host(t: &Tensor) -> Result<(Vec<i64>, Vec<i64>)> {
     let dims: Vec<i64> = t.dims().iter().map(|&d| d as i64).collect();
     let data: Vec<i64> = t.to_dtype(DType::I64)?.flatten_all()?.to_vec1()?;
+    Ok((data, dims))
+}
 
+/// Builds a CUDA `torch.int32` tensor from host i64 index data (GIL held).
+pub fn host_to_torch_int32(py: Python<'_>, data: Vec<i64>, dims: Vec<i64>) -> Result<Py<PyAny>> {
     let kernels = kernels_module(py)?;
     let arr = PyArray1::from_vec(py, data);
     kernels
@@ -145,13 +162,10 @@ pub fn cuda_synchronize(py: Python<'_>) -> Result<()> {
         .map_err(candle_core::Error::wrap)
 }
 
-/// Converts a `torch.Tensor` back into a candle `Tensor` on `device` with dtype `dtype`.
-pub fn torch_to_tensor(
-    py: Python<'_>,
-    obj: &Bound<'_, PyAny>,
-    device: &Device,
-    dtype: DType,
-) -> Result<Tensor> {
+/// Pulls a `torch.Tensor` to host f32 data plus its shape (GIL held). The device->host copy
+/// here runs on torch's stream, which never carries NCCL collectives, so it is safe to hold
+/// the GIL across it (unlike the candle-side copies above).
+pub fn torch_to_host(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<(Vec<f32>, Vec<usize>)> {
     let kernels = kernels_module(py)?;
     let host_array = kernels
         .getattr("to_host_array")
@@ -166,6 +180,11 @@ pub fn torch_to_tensor(
         .as_standard_layout()
         .into_owned()
         .into_raw_vec();
+    Ok((data, shape))
+}
 
+/// Builds a candle `Tensor` on `device` with dtype `dtype` from host f32 data. The
+/// host->device copy is pure candle work — call this WITHOUT the GIL held.
+pub fn host_to_tensor(data: Vec<f32>, shape: Vec<usize>, device: &Device, dtype: DType) -> Result<Tensor> {
     Tensor::from_vec(data, shape, device)?.to_dtype(dtype)
 }

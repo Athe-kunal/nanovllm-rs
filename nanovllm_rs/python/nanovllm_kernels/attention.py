@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from torch.utils.dlpack import from_dlpack
 
 from flash_attn import flash_attn_varlen_func
 
@@ -56,3 +57,45 @@ def flash_attn_varlen(
         max_seqlen_k=max_seqlen_k, cu_seqlens_k=cu_seqlens_k,
         softmax_scale=softmax_scale, causal=causal, block_table=block_table,
     )
+
+
+def flash_attn_varlen_dlpack(
+    q, k, v, out,
+    cu_seqlens_q, cu_seqlens_k,
+    max_seqlen_q: int, max_seqlen_k: int, softmax_scale: float,
+    slot_mapping=None, block_table=None, k_cache=None, v_cache=None,
+    stream_ptr: int = 0,
+):
+    """Zero-copy attention: q/k/v/out and the index tensors are candle-owned GPU buffers
+    wrapped via DLPack (no device<->host copy). Everything runs on candle's stream so the
+    handoff needs no synchronization, and the flash-attn result is written straight back into
+    candle's pre-allocated `out` buffer. Mirrors Attention::forward's host path exactly."""
+    q = from_dlpack(q)
+    # Bind the ExternalStream to *this rank's* device explicitly. Under tensor parallelism
+    # rank r runs on GPU r with its own candle stream; defaulting the stream's device (and
+    # thus leaving torch's kernels on the wrong device's default stream) races against candle's
+    # producing ops and NCCL collectives, silently corrupting rank>0 output.
+    device = q.device
+    stream = torch.cuda.ExternalStream(stream_ptr, device=device)
+    with torch.cuda.device(device), torch.cuda.stream(stream):
+        k = from_dlpack(k)
+        v = from_dlpack(v)
+        out = from_dlpack(out)
+        # flash-attn wants int32 cu_seqlens / block_table; candle produces them as int64.
+        cu_seqlens_q = from_dlpack(cu_seqlens_q).to(torch.int32)
+        cu_seqlens_k = from_dlpack(cu_seqlens_k).to(torch.int32)
+
+        if slot_mapping is not None and k_cache is not None and v_cache is not None:
+            store_kvcache(k, v, k_cache, v_cache, from_dlpack(slot_mapping).to(torch.int32))
+
+        if block_table is not None:
+            block_table = from_dlpack(block_table).to(torch.int32)
+            attn_k, attn_v = k_cache, v_cache
+        else:
+            attn_k, attn_v = k, v
+
+        result = flash_attn_varlen(
+            q, attn_k, attn_v, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k, softmax_scale, True, block_table,
+        )
+        out.copy_(result)

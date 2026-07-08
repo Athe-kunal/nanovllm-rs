@@ -24,3 +24,5 @@ nanovllm_rs/python/nanovllm_kernels.egg-info
 models
 nanovllm_rs/python/nanovllm_kernels/__pycache__
 .nccl_lib
+
+.claude
