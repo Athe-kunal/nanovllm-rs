@@ -10,3 +10,9 @@ impl SamplingParams {
         Self { temperature, max_tokens, ignore_eos }
     }
 }
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self::new(1.0, 64, false)
+    }
+}

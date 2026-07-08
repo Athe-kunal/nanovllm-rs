@@ -10,6 +10,7 @@ use activation::SiluAndMul;
 use rotary_embedding::RotaryEmbedding;
 use embed_head::{ParallelLMHead, VocabParallelEmbedding};
 use std::collections::HashMap;
+use pyo3::{Py, PyAny};
 
 pub struct Qwen3Attention{
     total_num_heads: usize,
@@ -115,6 +116,10 @@ impl Qwen3Attention{
         })
     }
 
+    pub fn set_kv_cache(&mut self, k_cache: Py<PyAny>, v_cache: Py<PyAny>) {
+        self.attn.set_kv_cache(k_cache, v_cache);
+    }
+
     pub fn forward(&mut self, positions: &Tensor, hidden_states: &Tensor) -> Result<Tensor>{
         let qkv = self.qkv_proj.forward(hidden_states)?;
         let (q,k,v) = split_qkv(&qkv, self.q_size, self.kv_size)?;
@@ -207,6 +212,10 @@ impl Qwen3DecoderLayer{
         Ok(Self { self_attn, mlp, input_layernorm, post_attention_layernorm })
     }
 
+    pub fn set_kv_cache(&mut self, k_cache: Py<PyAny>, v_cache: Py<PyAny>) {
+        self.self_attn.set_kv_cache(k_cache, v_cache);
+    }
+
     pub fn forward(
         &mut self,
         positions: &Tensor,
@@ -256,6 +265,13 @@ impl Qwen3Model{
         let norm = RMSNorm::new(config.hidden_size, config.rms_norm_eps as f32, device)?;
 
         Ok(Self { embed_tokens, layers, norm })
+    }
+
+    pub fn set_kv_caches(&mut self, kv_caches: Vec<(Py<PyAny>, Py<PyAny>)>) {
+        assert_eq!(kv_caches.len(), self.layers.len());
+        for (layer, (k_cache, v_cache)) in self.layers.iter_mut().zip(kv_caches) {
+            layer.set_kv_cache(k_cache, v_cache);
+        }
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, positions: &Tensor) -> Result<Tensor> {
@@ -321,6 +337,10 @@ impl Qwen3ForCausalLM{
         }
 
         Ok(Self { model, lm_head })
+    }
+
+    pub fn set_kv_caches(&mut self, kv_caches: Vec<(Py<PyAny>, Py<PyAny>)>) {
+        self.model.set_kv_caches(kv_caches);
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, positions: &Tensor) -> Result<Tensor> {

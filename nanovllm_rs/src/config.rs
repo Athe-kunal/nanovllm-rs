@@ -57,3 +57,33 @@ impl Config {
         }
     }
 }
+
+/// Runtime/scheduler settings, independent of any particular model — set by
+/// whoever starts the engine (batch limits, KV-cache sizing), not read from a
+/// model's HF `config.json`. Reused as-is regardless of which model `Config`
+/// (Qwen3, or a future one) is loaded alongside it.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub model_path: String,
+    pub tensor_parallel_size: usize,
+    pub chunked_prefill: bool,
+    pub max_num_seqs: usize,
+    pub max_num_batched_tokens: usize,
+    pub kvcache_block_size: usize,
+    // Set from GPU-memory profiling at engine startup; 0 until then.
+    pub num_kvcache_blocks: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            model_path: String::new(),
+            tensor_parallel_size: 1,
+            chunked_prefill: false,
+            max_num_seqs: 512,
+            max_num_batched_tokens: 16384,
+            kvcache_block_size: 256,
+            num_kvcache_blocks: 0,
+        }
+    }
+}

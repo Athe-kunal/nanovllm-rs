@@ -56,6 +56,43 @@ pub fn index_tensor_to_torch(py: Python<'_>, t: &Tensor) -> Result<Py<PyAny>> {
         .map_err(candle_core::Error::wrap)
 }
 
+/// Allocates the paged KV cache directly on the CUDA device (one `(k_cache, v_cache)`
+/// torch.Tensor pair per layer, each shaped `(num_blocks, block_size, num_kv_heads,
+/// head_dim)`). Done in Python rather than candle + `tensor_to_torch` because the
+/// cache is large, GPU-resident for the whole run, and only ever touched in place by
+/// the Python-side `store_kvcache`/`flash_attn_varlen` kernels — routing it through
+/// candle first would mean a pointless host round-trip for data that never needs to
+/// exist in Rust-side memory at all.
+#[allow(clippy::too_many_arguments)]
+pub fn allocate_kv_cache(
+    py: Python<'_>,
+    num_layers: usize,
+    num_blocks: usize,
+    block_size: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    dtype: DType,
+) -> Result<Vec<(Py<PyAny>, Py<PyAny>)>> {
+    let kernels = kernels_module(py)?;
+    let result = kernels
+        .getattr("allocate_kv_cache")
+        .and_then(|f| {
+            f.call1((
+                num_layers,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                torch_dtype_str(dtype),
+            ))
+        })
+        .map_err(candle_core::Error::wrap)?;
+
+    result
+        .extract::<Vec<(Py<PyAny>, Py<PyAny>)>>()
+        .map_err(candle_core::Error::wrap)
+}
+
 /// Converts a `torch.Tensor` back into a candle `Tensor` on `device` with dtype `dtype`.
 pub fn torch_to_tensor(
     py: Python<'_>,
