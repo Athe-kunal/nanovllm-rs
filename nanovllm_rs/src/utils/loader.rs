@@ -1,23 +1,27 @@
 use candle_core::{safetensors, Device, Result, Tensor};
 use std::collections::HashMap;
 
-pub type WeightLoader = fn(&mut Tensor, Tensor, Option<usize>) -> Result<()>;
-
-pub fn default_weight_loader(param: &mut Tensor, loaded_weight: Tensor, _shard_id: Option<usize>) -> Result<()> {
-    *param = loaded_weight;
-    Ok(())
+/// A packed sub-weight's shard id, which the checkpoint loader passes to the target
+/// layer's `weight_loader`. `QKVParallelLinear` keys shards by name ("q"/"k"/"v"),
+/// `MergedColumnParallelLinear` keys shards by index (0/1) — mirrors Python's dict
+/// mixing string ids (for qkv_proj) and int ids (for gate_up_proj) in one mapping.
+#[derive(Debug, Clone, Copy)]
+pub enum ShardId {
+    Name(&'static str),
+    Index(usize),
 }
 
 pub trait ModelWeights {
-    fn packed_modules_mapping(&self) -> HashMap<String, (String, usize)> {
+    fn packed_modules_mapping(&self) -> HashMap<String, (String, ShardId)> {
         HashMap::new()
     }
 
-    fn get_parameter_mut(&mut self, name: &str) -> Option<&mut Tensor>;
-
-    fn weight_loader(&self, _param_name: &str) -> WeightLoader {
-        default_weight_loader
-    }
+    /// Routes a single checkpoint tensor to wherever it belongs in the model.
+    /// `param_name` has already had any packed-module substitution applied (e.g.
+    /// `q_proj` -> `qkv_proj`). Implementations should silently no-op on names they
+    /// don't recognize (checkpoints commonly carry extra buffers that aren't real
+    /// parameters) rather than erroring the whole load over one unexpected key.
+    fn load_weight(&mut self, param_name: &str, loaded_weight: Tensor, shard_id: Option<ShardId>) -> Result<()>;
 }
 
 pub fn load_model<M: ModelWeights>(model: &mut M, path: &str) -> Result<()> {
@@ -39,20 +43,14 @@ pub fn load_model<M: ModelWeights>(model: &mut M, path: &str) -> Result<()> {
             for (k, (v, shard_id)) in packed_modules_mapping.iter() {
                 if weight_name.contains(k.as_str()) {
                     let param_name = weight_name.replace(k.as_str(), v.as_str());
-                    let loader = model.weight_loader(&param_name);
-                    if let Some(param) = model.get_parameter_mut(&param_name) {
-                        loader(param, loaded_weight.clone(), Some(*shard_id))?;
-                    }
+                    model.load_weight(&param_name, loaded_weight.clone(), Some(*shard_id))?;
                     matched = true;
                     break;
                 }
             }
 
             if !matched {
-                let loader = model.weight_loader(&weight_name);
-                if let Some(param) = model.get_parameter_mut(&weight_name) {
-                    loader(param, loaded_weight, None)?;
-                }
+                model.load_weight(&weight_name, loaded_weight, None)?;
             }
         }
     }

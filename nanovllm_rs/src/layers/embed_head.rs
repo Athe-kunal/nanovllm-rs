@@ -81,16 +81,29 @@ impl ParallelLMHead {
     pub fn tie_weights(&mut self, embed_tokens: &VocabParallelEmbedding) {
         self.base.weight = embed_tokens.weight.clone();
     }
-    pub fn forward(&self, x: &Tensor, cu_seqlens_q: &Tensor, seq_need_compute_logits: &[u32]) -> Result<Tensor> {
+
+    pub fn weight_loader(&mut self, loaded_weight: Tensor) -> Result<()> {
+        self.base.weight_loader(loaded_weight)
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let context = get_context();
+        let cu_seqlens_q = context
+            .cu_seqlens_q
+            .as_ref()
+            .expect("cu_seqlens_q must be set via set_context before calling ParallelLMHead::forward");
+
         let len = cu_seqlens_q.dim(0)?;
         let sliced: Vec<u32> = cu_seqlens_q.narrow(0, 1, len-1)?.to_vec1()?;
         let mut last_indices: Vec<u32> = sliced.iter().map(|v| v - 1).collect();
-        
-        if !seq_need_compute_logits.is_empty() {
-            last_indices = seq_need_compute_logits.iter().map(|&i| last_indices[i as usize]).collect();
 
+        if let Some(seq_need_compute_logits) = context.seq_need_compute_logits.as_ref() {
+            let seq_need_compute_logits: Vec<u32> = seq_need_compute_logits.to_dtype(candle_core::DType::U32)?.to_vec1()?;
+            if !seq_need_compute_logits.is_empty() {
+                last_indices = seq_need_compute_logits.iter().map(|&i| last_indices[i as usize]).collect();
+            }
         }
-        
+
         let idx = Tensor::new(last_indices.as_slice(), x.device())?;
         let x = x.index_select(&idx, 0)?.contiguous()?;
         let mut logits = x.matmul(&self.base.weight.t()?)?; // F.linear(x, weight) == x @ weight.T

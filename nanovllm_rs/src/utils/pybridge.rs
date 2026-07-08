@@ -93,6 +93,46 @@ pub fn allocate_kv_cache(
         .map_err(candle_core::Error::wrap)
 }
 
+pub fn cuda_mem_get_info(py: Python<'_>) -> Result<(u64, u64)> {
+    kernels_module(py)?
+        .getattr("mem_get_info")
+        .and_then(|f| f.call0())
+        .and_then(|r| r.extract::<(u64, u64)>())
+        .map_err(candle_core::Error::wrap)
+}
+
+pub fn cuda_memory_stats_peak_current(py: Python<'_>) -> Result<(u64, u64)> {
+    kernels_module(py)?
+        .getattr("memory_stats_peak_current")
+        .and_then(|f| f.call0())
+        .and_then(|r| r.extract::<(u64, u64)>())
+        .map_err(candle_core::Error::wrap)
+}
+
+pub fn cuda_empty_cache(py: Python<'_>) -> Result<()> {
+    kernels_module(py)?
+        .getattr("empty_cache")
+        .and_then(|f| f.call0())
+        .map(|_| ())
+        .map_err(candle_core::Error::wrap)
+}
+
+pub fn cuda_reset_peak_memory_stats(py: Python<'_>) -> Result<()> {
+    kernels_module(py)?
+        .getattr("reset_peak_memory_stats")
+        .and_then(|f| f.call0())
+        .map(|_| ())
+        .map_err(candle_core::Error::wrap)
+}
+
+pub fn cuda_synchronize(py: Python<'_>) -> Result<()> {
+    kernels_module(py)?
+        .getattr("synchronize")
+        .and_then(|f| f.call0())
+        .map(|_| ())
+        .map_err(candle_core::Error::wrap)
+}
+
 /// Converts a `torch.Tensor` back into a candle `Tensor` on `device` with dtype `dtype`.
 pub fn torch_to_tensor(
     py: Python<'_>,

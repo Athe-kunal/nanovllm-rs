@@ -19,6 +19,7 @@ pub struct LLMEngine {
     model_runner: ModelRunner,
     tokenizer: Tokenizer,
     scheduler: Scheduler,
+    block_size: usize,
 }
 
 impl LLMEngine {
@@ -31,6 +32,7 @@ impl LLMEngine {
             "multi-process tensor parallelism is not implemented yet"
         );
 
+        let block_size = engine_config.kvcache_block_size;
         let model_runner = ModelRunner::new(&config, &engine_config, 0);
 
         let tokenizer_path = std::path::Path::new(&engine_config.model_path).join("tokenizer.json");
@@ -38,7 +40,7 @@ impl LLMEngine {
 
         let scheduler = Scheduler::new(&config, &engine_config);
 
-        Self { model_runner, tokenizer, scheduler }
+        Self { model_runner, tokenizer, scheduler, block_size }
     }
 
     pub fn add_request_text(&mut self, prompt: &str, sampling_params: SamplingParams) {
@@ -47,7 +49,7 @@ impl LLMEngine {
     }
 
     pub fn add_request(&mut self, prompt: Vec<u32>, sampling_params: SamplingParams) {
-        let seq = Sequence::new(prompt, sampling_params);
+        let seq = Sequence::with_block_size(prompt, sampling_params, self.block_size);
         self.scheduler.add(seq);
     }
 

@@ -11,6 +11,7 @@ use rotary_embedding::RotaryEmbedding;
 use embed_head::{ParallelLMHead, VocabParallelEmbedding};
 use std::collections::HashMap;
 use pyo3::{Py, PyAny};
+use crate::utils::loader::{ModelWeights, ShardId};
 
 pub struct Qwen3Attention{
     total_num_heads: usize,
@@ -289,32 +290,13 @@ impl Qwen3Model{
     }
 }
 
-/// A packed sub-weight's shard id, which the checkpoint loader passes to the target
-/// layer's `weight_loader`. `QKVParallelLinear` keys shards by name ("q"/"k"/"v"),
-/// `MergedColumnParallelLinear` keys shards by index (0/1) — mirrors Python's dict
-/// mixing string ids (for qkv_proj) and int ids (for gate_up_proj) in one mapping.
-pub enum ShardId {
-    Name(&'static str),
-    Index(usize),
-}
-
 pub struct Qwen3ForCausalLM{
     model: Qwen3Model,
     lm_head: ParallelLMHead,
+    tie_word_embeddings: bool,
 }
 
 impl Qwen3ForCausalLM{
-    /// Equivalent of the `packed_modules_mapping` class attribute.
-    pub fn packed_modules_mapping() -> HashMap<&'static str, (&'static str, ShardId)> {
-        HashMap::from([
-            ("q_proj", ("qkv_proj", ShardId::Name("q"))),
-            ("k_proj", ("qkv_proj", ShardId::Name("k"))),
-            ("v_proj", ("qkv_proj", ShardId::Name("v"))),
-            ("gate_proj", ("gate_up_proj", ShardId::Index(0))),
-            ("up_proj", ("gate_up_proj", ShardId::Index(1))),
-        ])
-    }
-
     pub fn new(config: &Config, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
         let model = Qwen3Model::new(config, comm.clone(), device)?;
 
@@ -322,7 +304,7 @@ impl Qwen3ForCausalLM{
             Some(comm) => (comm.rank(), comm.world_size()),
             None => (0, 1),
         };
-        let mut lm_head = ParallelLMHead::new(
+        let lm_head = ParallelLMHead::new(
             config.vocab_size,
             config.hidden_size,
             false,
@@ -332,11 +314,19 @@ impl Qwen3ForCausalLM{
             device,
         )?;
 
-        if config.tie_word_embeddings {
-            lm_head.tie_weights(&model.embed_tokens);
-        }
+        // Not tied here yet: candle's `Tensor` is an immutable value, unlike
+        // torch's `.data`, which shares mutable storage — `tie_weights` only
+        // snapshots `embed_tokens.weight` at the moment it's called, so it must
+        // run after checkpoint loading (`tie_weights_if_configured`), not before.
+        Ok(Self { model, lm_head, tie_word_embeddings: config.tie_word_embeddings })
+    }
 
-        Ok(Self { model, lm_head })
+    /// Call after `loader::load_model` has populated `embed_tokens.weight` from
+    /// the checkpoint, so the tied `lm_head.weight` snapshot reflects real values.
+    pub fn tie_weights_if_configured(&mut self) {
+        if self.tie_word_embeddings {
+            self.lm_head.tie_weights(&self.model.embed_tokens);
+        }
     }
 
     pub fn set_kv_caches(&mut self, kv_caches: Vec<(Py<PyAny>, Py<PyAny>)>) {
@@ -347,12 +337,80 @@ impl Qwen3ForCausalLM{
         self.model.forward(input_ids, positions)
     }
 
-    pub fn compute_logits(
-        &self,
-        hidden_states: &Tensor,
-        cu_seqlens_q: &Tensor,
-        seq_need_compute_logits: &[u32],
-    ) -> Result<Tensor> {
-        self.lm_head.forward(hidden_states, cu_seqlens_q, seq_need_compute_logits)
+    pub fn compute_logits(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden_states)
+    }
+}
+
+impl ModelWeights for Qwen3ForCausalLM {
+    fn packed_modules_mapping(&self) -> HashMap<String, (String, ShardId)> {
+        HashMap::from([
+            ("q_proj".to_string(), ("qkv_proj".to_string(), ShardId::Name("q"))),
+            ("k_proj".to_string(), ("qkv_proj".to_string(), ShardId::Name("k"))),
+            ("v_proj".to_string(), ("qkv_proj".to_string(), ShardId::Name("v"))),
+            ("gate_proj".to_string(), ("gate_up_proj".to_string(), ShardId::Index(0))),
+            ("up_proj".to_string(), ("gate_up_proj".to_string(), ShardId::Index(1))),
+        ])
+    }
+
+    fn load_weight(&mut self, param_name: &str, loaded_weight: Tensor, shard_id: Option<ShardId>) -> Result<()> {
+        if let Some(rest) = param_name.strip_prefix("model.layers.") {
+            let mut parts = rest.splitn(2, '.');
+            let idx: usize = match parts.next().and_then(|s| s.parse().ok()) {
+                Some(idx) => idx,
+                None => return Ok(()),
+            };
+            let suffix = parts.next().unwrap_or("");
+            let layer = match self.model.layers.get_mut(idx) {
+                Some(layer) => layer,
+                None => return Ok(()),
+            };
+
+            return match suffix {
+                "self_attn.qkv_proj.weight" => match shard_id {
+                    Some(ShardId::Name(shard)) => layer.self_attn.qkv_proj.weight_loader(loaded_weight, shard),
+                    _ => candle_core::bail!("qkv_proj requires a name shard id, got {param_name}"),
+                },
+                "self_attn.o_proj.weight" => layer.self_attn.o_proj.weight_loader(loaded_weight),
+                "self_attn.q_norm.weight" => {
+                    if let Some(q_norm) = layer.self_attn.q_norm.as_mut() {
+                        q_norm.weight_loader(loaded_weight);
+                    }
+                    Ok(())
+                }
+                "self_attn.k_norm.weight" => {
+                    if let Some(k_norm) = layer.self_attn.k_norm.as_mut() {
+                        k_norm.weight_loader(loaded_weight);
+                    }
+                    Ok(())
+                }
+                "mlp.gate_up_proj.weight" => match shard_id {
+                    Some(ShardId::Index(shard)) => layer.mlp.gate_up_proj.weight_loader(loaded_weight, shard),
+                    _ => candle_core::bail!("gate_up_proj requires an index shard id, got {param_name}"),
+                },
+                "mlp.down_proj.weight" => layer.mlp.down_proj.weight_loader(loaded_weight),
+                "input_layernorm.weight" => {
+                    layer.input_layernorm.weight_loader(loaded_weight);
+                    Ok(())
+                }
+                "post_attention_layernorm.weight" => {
+                    layer.post_attention_layernorm.weight_loader(loaded_weight);
+                    Ok(())
+                }
+                // Unrecognized per-layer key (e.g. a saved rotary-embedding buffer) — skip.
+                _ => Ok(()),
+            };
+        }
+
+        match param_name {
+            "model.embed_tokens.weight" => self.model.embed_tokens.weight_loader(loaded_weight),
+            "model.norm.weight" => {
+                self.model.norm.weight_loader(loaded_weight);
+                Ok(())
+            }
+            "lm_head.weight" => self.lm_head.weight_loader(loaded_weight),
+            // Unrecognized top-level key — skip.
+            _ => Ok(()),
+        }
     }
 }

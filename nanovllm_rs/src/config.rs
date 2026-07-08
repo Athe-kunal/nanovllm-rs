@@ -21,10 +21,16 @@ pub struct Config {
     pub attention_bias: bool,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    #[serde(default = "default_torch_dtype")]
+    pub torch_dtype: String,
 }
 
 fn default_attention_bias() -> bool {
     true
+}
+
+fn default_torch_dtype() -> String {
+    "float32".to_string()
 }
 
 impl Config {
@@ -54,6 +60,7 @@ impl Config {
             hidden_act: "silu".to_string(),
             attention_bias: false,
             tie_word_embeddings: true,
+            torch_dtype: "float32".to_string(),
         }
     }
 }
@@ -72,6 +79,11 @@ pub struct EngineConfig {
     pub kvcache_block_size: usize,
     // Set from GPU-memory profiling at engine startup; 0 until then.
     pub num_kvcache_blocks: usize,
+    pub gpu_memory_utilization: f64,
+    // CUDA graph capture/replay can't work across the candle/torch split (the model
+    // forward pass runs through candle, invisible to torch's graph capture), so this
+    // must stay true; ModelRunner::capture_cudagraph panics if ever actually invoked.
+    pub enforce_eager: bool,
 }
 
 impl Default for EngineConfig {
@@ -84,6 +96,8 @@ impl Default for EngineConfig {
             max_num_batched_tokens: 16384,
             kvcache_block_size: 256,
             num_kvcache_blocks: 0,
+            gpu_memory_utilization: 0.9,
+            enforce_eager: true,
         }
     }
 }

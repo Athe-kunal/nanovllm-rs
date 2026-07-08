@@ -11,6 +11,10 @@ impl RMSNorm {
         Ok(Self { weight, eps})
     }
 
+    pub fn weight_loader(&mut self, loaded_weight: Tensor) {
+        self.weight = loaded_weight;
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor>{
         let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
         let x_normed = x.broadcast_div(&(variance + self.eps as f64)?.sqrt()?)?;
