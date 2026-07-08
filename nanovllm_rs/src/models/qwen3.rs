@@ -1,6 +1,6 @@
 use candle_core::{Device, Result, Tensor, DType, D};
-use cudarc::nccl::safe::Comm;
-use std::rc::Rc;
+use crate::layers::nccl::Comm;
+use std::sync::Arc;
 use crate::config::Config;
 use crate::layers::{activation,attention,dist_util,layernorm,linear,embed_head,rotary_embedding};
 use attention::Attention;
@@ -49,7 +49,7 @@ impl Qwen3Attention{
         rms_norm_eps: f32,
         qkv_bias: bool,
         rope_theta: f32,
-        comm: Option<Rc<Comm>>,
+        comm: Option<Arc<Comm>>,
         device: &Device,
     ) -> Result<Self> {
         let tp_size = match &comm {
@@ -155,7 +155,7 @@ impl Qwen3MLP{
         hidden_size: usize,
         intermediate_size: usize,
         hidden_act: &str,
-        comm: Option<Rc<Comm>>,
+        comm: Option<Arc<Comm>>,
         device: &Device,
     ) -> Result<Self> {
         let gate_up_proj = MergedColumnParallelLinear::new(
@@ -187,7 +187,7 @@ pub struct Qwen3DecoderLayer{
 }
 
 impl Qwen3DecoderLayer{
-    pub fn new(config: &Config, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(config: &Config, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let self_attn = Qwen3Attention::new(
             config.hidden_size,
             config.num_attention_heads,
@@ -244,7 +244,7 @@ pub struct Qwen3Model{
 }
 
 impl Qwen3Model{
-    pub fn new(config: &Config, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(config: &Config, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let (tp_rank, tp_size) = match &comm {
             Some(comm) => (comm.rank(), comm.world_size()),
             None => (0, 1),
@@ -297,7 +297,7 @@ pub struct Qwen3ForCausalLM{
 }
 
 impl Qwen3ForCausalLM{
-    pub fn new(config: &Config, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(config: &Config, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let model = Qwen3Model::new(config, comm.clone(), device)?;
 
         let (tp_rank, tp_size) = match &comm {

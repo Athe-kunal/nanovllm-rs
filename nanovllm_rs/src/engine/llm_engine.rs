@@ -8,6 +8,7 @@ use crate::config::{Config, EngineConfig};
 use crate::engine::model_runner::ModelRunner;
 use crate::engine::scheduler::Scheduler;
 use crate::engine::sequence::Sequence;
+use crate::engine::worker::{self, WorkerHandle};
 use crate::sampling_params::SamplingParams;
 
 pub struct GeneratedOutput {
@@ -17,30 +18,32 @@ pub struct GeneratedOutput {
 
 pub struct LLMEngine {
     model_runner: ModelRunner,
+    workers: Vec<WorkerHandle>,
     tokenizer: Tokenizer,
     scheduler: Scheduler,
     block_size: usize,
 }
 
 impl LLMEngine {
-    pub fn new(config: Config, engine_config: EngineConfig) -> Self {
-        // Spawning worker processes per tensor-parallel rank (Python's
-        // `mp.Process(target=ModelRunner, ...)`) isn't implemented — that needs real
-        // inter-process NCCL bring-up this codebase doesn't have yet.
-        assert_eq!(
-            engine_config.tensor_parallel_size, 1,
-            "multi-process tensor parallelism is not implemented yet"
-        );
-
+    pub fn new(config: Config, mut engine_config: EngineConfig) -> Self {
         let block_size = engine_config.kvcache_block_size;
-        let model_runner = ModelRunner::new(&config, &engine_config, 0);
+
+        let (model_runner, workers) = if engine_config.tensor_parallel_size > 1 {
+            worker::init_tensor_parallel(&config, &engine_config)
+        } else {
+            let mut runner = ModelRunner::new(&config, &engine_config, 0, None);
+            let num_blocks = runner.probe_num_kvcache_blocks();
+            runner.finish_setup(num_blocks);
+            (runner, Vec::new())
+        };
+        engine_config.num_kvcache_blocks = model_runner.num_kvcache_blocks();
 
         let tokenizer_path = std::path::Path::new(&engine_config.model_path).join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
 
         let scheduler = Scheduler::new(&config, &engine_config);
 
-        Self { model_runner, tokenizer, scheduler, block_size }
+        Self { model_runner, workers, tokenizer, scheduler, block_size }
     }
 
     pub fn add_request_text(&mut self, prompt: &str, sampling_params: SamplingParams) {
@@ -55,6 +58,9 @@ impl LLMEngine {
 
     pub fn step(&mut self) -> (Vec<(usize, Vec<u32>)>, usize) {
         let mut seqs = self.scheduler.schedule();
+        for worker in &self.workers {
+            worker.run(seqs.clone());
+        }
         let (token_ids, seq_need_compute_logits) = self.model_runner.run(&mut seqs);
         self.scheduler.postprocess(&mut seqs, &token_ids, &seq_need_compute_logits);
 

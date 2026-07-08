@@ -142,7 +142,7 @@ impl BlockManager{
         let mut h: i64 = -1;
 
         for i in 0..seq.num_blocks(){
-            let token_ids = seq.block(i);
+            let token_ids = seq.block(i).to_vec();
             let token_ids_i64: Vec<i64> = token_ids.iter().map(|&t| t as i64).collect();
 
             h = if token_ids.len() == self.block_size {
@@ -166,7 +166,7 @@ impl BlockManager{
             } else {
                 self.allocate_block(block_id);
             }
-            self.blocks[block_id].update(h, token_ids.to_vec());
+            self.blocks[block_id].update(h, token_ids);
             self.hash_to_block_id.insert(h, block_id);
             seq.block_table.push(block_id);
         }
@@ -235,7 +235,7 @@ impl BlockManager{
         let mut i = range_start;
         while i < range_end{
             let chunk_end = std::cmp::min(i+self.block_size, range_end);
-            let token_ids = seq.slice_tokens(i, chunk_end);
+            let token_ids = seq.slice_tokens(i, chunk_end).to_vec();
             let token_ids_i64: Vec<i64> = token_ids.iter().map(|&t| t as i64).collect();
 
             let block_idx = i / self.block_size;

@@ -1,7 +1,7 @@
 use candle_core::{Device, Result, Tensor, DType};
 use candle_nn::{Embedding, Module};
-use cudarc::nccl::safe::Comm;
-use std::rc::Rc;
+use crate::layers::nccl::Comm;
+use std::sync::Arc;
 use crate::{layers::dist_util, utils::context::get_context};
 
 pub struct VocabParallelEmbedding {
@@ -13,16 +13,16 @@ pub struct VocabParallelEmbedding {
     vocab_start_idx: usize,
     vocab_end_idx: usize,
     weight: Tensor,
-    comm: Option<Rc<Comm>>,
+    comm: Option<Arc<Comm>>,
 }
 
 impl VocabParallelEmbedding{
-    pub fn new(num_embeddings: usize, embedding_dim: usize, tp_rank: usize, tp_size: usize, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self>{
+    pub fn new(num_embeddings: usize, embedding_dim: usize, tp_rank: usize, tp_size: usize, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
         assert_eq!(num_embeddings % tp_size,0, "num_embeddings should be divisible by tp_size");
         assert!(tp_size == 1 || comm.is_some(), "comm is required when tp_size > 1");
 
         let num_embeddings_per_partition = num_embeddings / tp_size;
-        let weight = Tensor::empty((num_embeddings_per_partition,embedding_dim), DType::F32, device)?;
+        let weight = Tensor::zeros((num_embeddings_per_partition,embedding_dim), DType::F32, device)?;
         let vocab_start_idx = num_embeddings_per_partition * tp_rank;
         let vocab_end_idx = vocab_start_idx + num_embeddings_per_partition;
 
@@ -66,7 +66,7 @@ pub struct ParallelLMHead {
 }
 
 impl ParallelLMHead {
-    pub fn new(num_embeddings: usize, embedding_dim: usize, bias: bool, tp_rank: usize, tp_size: usize, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(num_embeddings: usize, embedding_dim: usize, bias: bool, tp_rank: usize, tp_size: usize, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         assert!(!bias, "bias is not supported");
 
         let base = VocabParallelEmbedding::new(num_embeddings, embedding_dim, tp_rank, tp_size, comm, device)?;

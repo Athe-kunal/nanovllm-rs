@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Result, Tensor};
-use numpy::{PyArray1, PyReadonlyArrayDyn};
+use numpy::{PyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use std::sync::OnceLock;
@@ -90,6 +90,18 @@ pub fn allocate_kv_cache(
 
     result
         .extract::<Vec<(Py<PyAny>, Py<PyAny>)>>()
+        .map_err(candle_core::Error::wrap)
+}
+
+/// `nanovllm_kernels`'s CUDA calls (mem_get_info, allocate_kv_cache, .cuda(), ...) all
+/// operate on torch's implicit current device, which is separate, per-OS-thread state
+/// that candle's own `Device::cuda_if_available` doesn't set. Must be called once on
+/// every tensor-parallel rank's thread before any other pybridge call on that thread.
+pub fn set_cuda_device(py: Python<'_>, device_index: usize) -> Result<()> {
+    PyModule::import(py, "torch")
+        .and_then(|torch| torch.getattr("cuda"))
+        .and_then(|cuda| cuda.call_method1("set_device", (device_index,)))
+        .map(|_| ())
         .map_err(candle_core::Error::wrap)
 }
 

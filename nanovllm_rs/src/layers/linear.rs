@@ -1,8 +1,8 @@
 use candle_core::{Device, Result, Tensor, DType};
-use cudarc::nccl::safe::Comm;
+use crate::layers::nccl::Comm;
 use candle_nn::{Linear, Module};
 use crate::layers::dist_util;
-use std::rc::Rc;
+use std::sync::Arc;
 
 fn divide(numerator: usize, denominator: usize) -> usize {
     assert_eq!(numerator % denominator, 0, "numerator must be divisible by denominator");
@@ -17,19 +17,19 @@ pub struct LinearBase{
     bias: Option<Tensor>,
     tp_rank: usize,
     tp_size: usize,
-    comm: Option<Rc<Comm>>,
+    comm: Option<Arc<Comm>>,
 }
 
 impl LinearBase{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, tp_dim: Option<usize>, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self>{
+    pub fn new(input_size: usize, output_size: usize, bias: bool, tp_dim: Option<usize>, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
         let (tp_rank, tp_size) = match &comm {
             Some(comm) => (comm.rank(), comm.world_size()),
             None => (0, 1),
         };
 
-        let weight = Tensor::empty((output_size, input_size), DType::F32, device)?;
+        let weight = Tensor::zeros((output_size, input_size), DType::F32, device)?;
         let bias = if bias {
-            Some(Tensor::empty(output_size, DType::F32, device)?)
+            Some(Tensor::zeros(output_size, DType::F32, device)?)
         } else {
             None
         };
@@ -61,7 +61,7 @@ pub struct ReplicatedLinear{
 }
 
 impl ReplicatedLinear{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let base = LinearBase::new(input_size, output_size, bias, None, comm, device)?;
         Ok(Self { base })
     }
@@ -80,7 +80,7 @@ pub struct ColumnParallelLinear{
 }
 
 impl ColumnParallelLinear{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let (tp_rank, tp_size) = match &comm {
             Some(comm) => (comm.rank(), comm.world_size()),
             None => (0, 1),
@@ -113,7 +113,7 @@ pub struct MergedColumnParallelLinear{
 }
 
 impl MergedColumnParallelLinear {
-    pub fn new(input_size: usize, output_sizes: Vec<usize>, bias: bool, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self>{
+    pub fn new(input_size: usize, output_sizes: Vec<usize>, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self>{
         let output_size = output_sizes.iter().sum();
         let base = ColumnParallelLinear::new(input_size, output_size, bias, comm, device)?;
         Ok(Self { base, output_sizes })
@@ -155,7 +155,7 @@ pub struct RowParallelLinear{
 }
 
 impl RowParallelLinear{
-    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Rc<Comm>>, device: &Device) -> Result<Self> {
+    pub fn new(input_size: usize, output_size: usize, bias: bool, comm: Option<Arc<Comm>>, device: &Device) -> Result<Self> {
         let tp_size = match &comm {
             Some(comm) => comm.world_size(),
             None => 1,
@@ -224,7 +224,7 @@ impl QKVParallelLinear{
         total_num_heads: usize,
         total_num_kv_heads: Option<usize>,
         bias: bool,
-        comm: Option<Rc<Comm>>,
+        comm: Option<Arc<Comm>>,
         device: &Device,
     ) -> Result<Self> {
         let tp_size = match &comm {

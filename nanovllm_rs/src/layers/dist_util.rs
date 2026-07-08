@@ -1,14 +1,35 @@
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, CustomOp1, DType, Layout,Result,Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
-use cudarc::nccl::safe::{Comm, ReduceOp};
+use crate::layers::nccl::Comm;
+#[cfg(feature = "cuda")]
+use cudarc::nccl::sys::ncclDataType_t;
 #[cfg(feature = "cuda")]
 use half::bf16;
-use std::rc::Rc;
+use std::sync::Arc;
 
-pub struct AllReduce{
-    pub comm: Rc<Comm>
+#[cfg(feature = "cuda")]
+fn nccl_dtype(dtype: DType) -> Result<ncclDataType_t> {
+    match dtype {
+        DType::BF16 => Ok(ncclDataType_t::ncclBfloat16),
+        DType::F32 => Ok(ncclDataType_t::ncclFloat32),
+        dtype => candle_core::bail!("unsupported dtype {dtype:?}"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_stream(dev: &candle_core::CudaDevice) -> cudarc::nccl::sys::cudaStream_t {
+    // CUstream (candle's vendored cudarc) and cudaStream_t (this crate's cudarc) are
+    // both opaque `*mut CUstream_st` under the hood — same CUDA ABI, different Rust
+    // crate instances, so a raw-pointer cast bridges them.
+    (*dev.cuda_device().cu_stream()) as *mut std::ffi::c_void as cudarc::nccl::sys::cudaStream_t
+}
+
+pub struct AllReduce {
+    pub comm: Arc<Comm>,
 }
 
 unsafe impl Sync for AllReduce {}
@@ -19,7 +40,7 @@ impl CustomOp1 for AllReduce {
         "allreduce"
     }
 
-    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!("AllReduce is never used on cpu")
     }
 
@@ -27,29 +48,38 @@ impl CustomOp1 for AllReduce {
     fn cuda_fwd(&self, s: &candle_core::CudaStorage, l: &Layout) -> Result<(candle_core::CudaStorage, Shape)> {
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
-        let dst = match s.dtype() {
-            DType::BF16 => {
-                let s = s.as_cuda_slice::<bf16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
+        let dtype = nccl_dtype(s.dtype())?;
+        let stream = cuda_stream(&dev);
+
+        macro_rules! reduce {
+            ($t:ty) => {{
+                let src = s.as_cuda_slice::<$t>()?;
+                let src = match l.contiguous_offsets() {
+                    Some((0, len)) if len == elem_count => src,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
-                self.comm.all_reduce(s, &mut dst, &ReduceOp::Sum).map_err(candle_core::Error::debug)?;
+                let mut dst = unsafe { dev.alloc::<$t>(elem_count) }.w()?;
+                let send_ptr = *src.device_ptr();
+                let recv_ptr = *dst.device_ptr_mut();
+                unsafe { self.comm.all_reduce_sum_raw(send_ptr, recv_ptr, elem_count, dtype, stream) }?;
                 candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
-            }
+            }};
+        }
+        let dst = match s.dtype() {
+            DType::BF16 => reduce!(bf16),
+            DType::F32 => reduce!(f32),
             dtype => candle_core::bail!("unsupported dtype {dtype:?}"),
         };
         Ok((dst, l.shape().clone()))
     }
 }
 
-pub fn all_reduce_sum(x: &Tensor, comm: &Rc<Comm>) -> Result<Tensor> {
+pub fn all_reduce_sum(x: &Tensor, comm: &Arc<Comm>) -> Result<Tensor> {
     x.apply_op1_no_bwd(&AllReduce { comm: comm.clone() })
 }
 
-pub struct AllGather{
-    pub comm: Rc<Comm>
+pub struct AllGather {
+    pub comm: Arc<Comm>,
 }
 
 unsafe impl Sync for AllGather {}
@@ -60,7 +90,7 @@ impl CustomOp1 for AllGather {
         "allgather"
     }
 
-    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!("AllGather is never used on cpu")
     }
 
@@ -69,17 +99,26 @@ impl CustomOp1 for AllGather {
         let world_size = self.comm.world_size();
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
-        let dst = match s.dtype() {
-            DType::BF16 => {
-                let s = s.as_cuda_slice::<bf16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
+        let dtype = nccl_dtype(s.dtype())?;
+        let stream = cuda_stream(&dev);
+
+        macro_rules! gather {
+            ($t:ty) => {{
+                let src = s.as_cuda_slice::<$t>()?;
+                let src = match l.contiguous_offsets() {
+                    Some((0, len)) if len == elem_count => src,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<bf16>(elem_count * world_size) }.w()?;
-                self.comm.all_gather(s, &mut dst).map_err(candle_core::Error::debug)?;
+                let mut dst = unsafe { dev.alloc::<$t>(elem_count * world_size) }.w()?;
+                let send_ptr = *src.device_ptr();
+                let recv_ptr = *dst.device_ptr_mut();
+                unsafe { self.comm.all_gather_raw(send_ptr, recv_ptr, elem_count, dtype, stream) }?;
                 candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
-            }
+            }};
+        }
+        let dst = match s.dtype() {
+            DType::BF16 => gather!(bf16),
+            DType::F32 => gather!(f32),
             dtype => candle_core::bail!("unsupported dtype {dtype:?}"),
         };
         let mut out_dims = l.shape().dims().to_vec();
@@ -88,13 +127,13 @@ impl CustomOp1 for AllGather {
     }
 }
 
-pub fn all_gather(x: &Tensor, comm: &Rc<Comm>) -> Result<Tensor> {
+pub fn all_gather(x: &Tensor, comm: &Arc<Comm>) -> Result<Tensor> {
     x.apply_op1_no_bwd(&AllGather { comm: comm.clone() })
 }
 
 /// Gathers `x` (sharded along the last dim across ranks) and concatenates the shards
 /// back into the full last dim, on every rank (NCCL has no root-only gather primitive).
-pub fn gather_concat(x: &Tensor, comm: &Rc<Comm>) -> Result<Tensor> {
+pub fn gather_concat(x: &Tensor, comm: &Arc<Comm>) -> Result<Tensor> {
     let world_size = comm.world_size();
     let dims = x.dims().to_vec();
 

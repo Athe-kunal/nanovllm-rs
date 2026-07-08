@@ -1,8 +1,10 @@
 use candle_core::{DType, Device, Result, Tensor};
 use pyo3::prelude::*;
+use std::sync::Arc;
 
 use crate::config::{Config, EngineConfig};
 use crate::engine::sequence::Sequence;
+use crate::layers::nccl::Comm;
 use crate::layers::sampler::Sampler;
 use crate::models::qwen3::Qwen3ForCausalLM;
 use crate::sampling_params::SamplingParams;
@@ -43,17 +45,12 @@ pub struct ModelRunner {
 }
 
 impl ModelRunner {
-    pub fn new(config: &Config, engine_config: &EngineConfig, rank: usize) -> Self {
-        // Multi-process worker fan-out (Python's dist.init_process_group +
-        // multiprocessing.shared_memory loop/read_shm/write_shm/call) isn't
-        // implemented: LLMEngine::new already asserts tensor_parallel_size == 1,
-        // so it's unreachable, and `call`'s whole point (dynamic getattr(self,
-        // method_name) dispatch) has no equivalent in a statically-typed language
-        // anyway — callers just call `run`/`exit` directly.
-        assert_eq!(engine_config.tensor_parallel_size, 1);
-
+    /// KV cache is allocated separately via `probe_num_kvcache_blocks`/`finish_setup`,
+    /// since under TP the block count must be reconciled across ranks first.
+    pub fn new(config: &Config, engine_config: &EngineConfig, rank: usize, comm: Option<Arc<Comm>>) -> Self {
+        Python::with_gil(|py| pybridge::set_cuda_device(py, rank)).expect("failed to set cuda device");
         let device = Device::cuda_if_available(rank).expect("failed to create device");
-        let mut model = Qwen3ForCausalLM::new(config, None, &device).expect("failed to build model");
+        let mut model = Qwen3ForCausalLM::new(config, comm, &device).expect("failed to build model");
         loader::load_model(&mut model, &engine_config.model_path).expect("failed to load model weights");
         model.tie_weights_if_configured();
 
@@ -68,12 +65,14 @@ impl ModelRunner {
         };
 
         runner.warmup_model();
-        runner.allocate_kv_cache();
-        if !engine_config.enforce_eager {
-            runner.capture_cudagraph();
-        }
-
         runner
+    }
+
+    pub fn finish_setup(&mut self, num_blocks: usize) {
+        self.allocate_kv_cache(num_blocks);
+        if !self.engine_config.enforce_eager {
+            self.capture_cudagraph();
+        }
     }
 
     fn prepare_block_tables(&self, seqs: &[Sequence]) -> Result<Tensor> {
@@ -277,15 +276,20 @@ impl ModelRunner {
         let _ = Python::with_gil(|py| pybridge::cuda_empty_cache(py));
     }
 
-    fn allocate_kv_cache(&mut self) {
+    fn num_kv_heads_per_rank(&self) -> usize {
+        self.config.num_key_value_heads / self.engine_config.tensor_parallel_size
+    }
+
+    /// Computes the local KV-cache block budget without allocating; under TP the
+    /// caller must reconcile (min) across ranks before calling `finish_setup`.
+    pub fn probe_num_kvcache_blocks(&self) -> usize {
         let (free, total) =
             Python::with_gil(|py| pybridge::cuda_mem_get_info(py)).expect("mem_get_info failed");
         let used = total - free;
         let (peak, current) = Python::with_gil(|py| pybridge::cuda_memory_stats_peak_current(py))
             .expect("memory_stats failed");
 
-        // Single-process only: real TP > 1 would divide num_kv_heads by world_size.
-        let num_kv_heads = self.config.num_key_value_heads;
+        let num_kv_heads = self.num_kv_heads_per_rank();
         let head_dim = self.config.head_dim;
         let dtype_bytes = dtype_itemsize(&self.config.torch_dtype);
         let block_bytes = 2
@@ -300,6 +304,12 @@ impl ModelRunner {
             + current as i64;
         let num_kvcache_blocks = (budget / block_bytes as i64).max(0) as usize;
         assert!(num_kvcache_blocks > 0, "not enough GPU memory left to allocate the KV cache");
+        num_kvcache_blocks
+    }
+
+    fn allocate_kv_cache(&mut self, num_kvcache_blocks: usize) {
+        let num_kv_heads = self.num_kv_heads_per_rank();
+        let head_dim = self.config.head_dim;
 
         let kv_caches = Python::with_gil(|py| {
             pybridge::allocate_kv_cache(
@@ -316,6 +326,10 @@ impl ModelRunner {
 
         self.model.set_kv_caches(kv_caches);
         self.num_kvcache_blocks = num_kvcache_blocks;
+    }
+
+    pub fn num_kvcache_blocks(&self) -> usize {
+        self.num_kvcache_blocks
     }
 
     pub fn exit(&mut self) {

@@ -1,6 +1,6 @@
-mod config;
-mod engine;
+pub mod config;
+pub mod engine;
 mod layers;
 mod models;
-mod sampling_params;
+pub mod sampling_params;
 mod utils;
