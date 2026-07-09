@@ -46,14 +46,20 @@ impl LLMEngine {
         Self { model_runner, workers, tokenizer, scheduler, block_size }
     }
 
-    pub fn add_request_text(&mut self, prompt: &str, sampling_params: SamplingParams) {
+    pub fn add_request_text(&mut self, prompt: &str, sampling_params: SamplingParams) -> usize {
         let encoding = self.tokenizer.encode(prompt, true).expect("tokenizer encode failed");
-        self.add_request(encoding.get_ids().to_vec(), sampling_params);
+        self.add_request(encoding.get_ids().to_vec(), sampling_params)
     }
 
-    pub fn add_request(&mut self, prompt: Vec<u32>, sampling_params: SamplingParams) {
+    pub fn add_request(&mut self, prompt: Vec<u32>, sampling_params: SamplingParams) -> usize {
         let seq = Sequence::with_block_size(prompt, sampling_params, self.block_size);
+        let seq_id = seq.seq_id;
         self.scheduler.add(seq);
+        seq_id
+    }
+
+    pub fn decode(&self, token_ids: &[u32]) -> String {
+        self.tokenizer.decode(token_ids, true).expect("tokenizer decode failed")
     }
 
     pub fn step(&mut self) -> (Vec<(usize, Vec<u32>)>, usize) {

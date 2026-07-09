@@ -17,6 +17,8 @@ serde_json = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 tokenizers = "0.20"
 indicatif = "0.17"
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [features]
 cuda = ["candle-core/cuda"]
