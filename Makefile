@@ -21,6 +21,8 @@ TEMPERATURE ?= 1.0
 
 install-python:
 	uv pip install --system -e nanovllm_rs/python --extra-index-url https://download.pytorch.org/whl/cu128
+	chmod -R a+rX /usr/local/lib/python3.10/dist-packages 2>/dev/null || \
+		sudo chmod -R a+rX /usr/local/lib/python3.10/dist-packages
 
 nccl-lib:
 	mkdir -p .nccl_lib
