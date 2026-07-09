@@ -14,14 +14,17 @@ Run all `make` commands as the **same user** throughout (don't mix `root` and a 
 ## Setup
 
 ```
-make install-python   # installs the Python deps (torch, kernels, etc.)
-make serve             # downloads the model, builds, and starts the server
+make install-python                          # installs the Python deps (torch, kernels, etc.)
+make download-model MODEL=Qwen/Qwen3-0.6B     # pulls the model from Hugging Face into models/
+make serve                                    # builds and starts the server
 ```
 
-`make serve` defaults to `Qwen/Qwen3-0.6B` on port 8000 with `--tensor-parallel-size 1`. Override with `MODEL`, `PORT`, `TP_SIZE`:
+`make serve` also downloads the model itself if it isn't already present, so a separate `download-model` step is optional — useful mainly to pre-fetch a model ahead of time.
+
+Defaults to `Qwen/Qwen3-0.6B` on port 8000 with `--tensor-parallel-size 1`. Override with `MODEL`, `PORT`, `TP_SIZE` — any Qwen3 model works (e.g. `Qwen/Qwen3-4B-Instruct-2507`), since the engine reads model dimensions and chat template from the model's own files rather than hardcoding them:
 
 ```
-make serve TP_SIZE=2
+make serve MODEL=Qwen/Qwen3-4B-Instruct-2507 TP_SIZE=2
 ```
 
 ## Using the server

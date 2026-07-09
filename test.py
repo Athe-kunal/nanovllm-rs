@@ -1,6 +1,6 @@
 import asyncio, httpx
 
-prompts = ["The capital of France is", "The capital of Japan is", "2 + 2 ="]
+prompts = ["What is the capital of France?", "What is the capital of Japan?", "What is 2 + 2 ="]
 
 async def generate(client, prompt):
     r = await client.post("http://localhost:8000/generate",
