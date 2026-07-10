@@ -7,8 +7,28 @@ export PATH := $(HOME)/.cargo/bin:/usr/local/cuda/bin:$(PATH)
 # falls through to the system copy and cudarc/torch end up with two ABI-mismatched NCCLs in
 # the same process. .nccl_lib/libnccl.so (created below) symlinks to torch's copy so both
 # resolve to the exact same file.
-export LD_LIBRARY_PATH := $(CURDIR)/.nccl_lib:$(LD_LIBRARY_PATH)
-TORCH_NCCL_LIB := /usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2
+# flash-attn ships only a cp310 wheel, so the venv is pinned to Python 3.10 regardless of
+# whatever system Python is on PATH. uv fetches that interpreter itself if it's missing.
+VENV_DIR := $(CURDIR)/.venv
+export VIRTUAL_ENV := $(VENV_DIR)
+export PYO3_PYTHON := $(VENV_DIR)/bin/python
+export PATH := $(VENV_DIR)/bin:$(PATH)
+VENV_SITE_PACKAGES := $(VENV_DIR)/lib/python3.10/site-packages
+TORCH_NCCL_LIB := $(VENV_SITE_PACKAGES)/nvidia/nccl/lib/libnccl.so.2
+# The venv's python is a symlink into uv's standalone interpreter install: its
+# libpython3.10.so.1.0 and stdlib live there, not in the venv, and pyo3's embedded
+# interpreter needs PYTHONHOME to find them (the venv itself has no copy of the stdlib).
+UV_PYTHON_HOME := $(patsubst %/,%,$(dir $(realpath $(VENV_DIR)/bin/python)))/..
+export PYTHONHOME := $(UV_PYTHON_HOME)
+# uv's editable install of nanovllm_kernels relies on a .pth-triggered import finder, which
+# only runs when site-packages is scanned via sys.prefix (i.e. actual venv startup) — a
+# PYTHONHOME override skips that, so the package source dir is added directly instead.
+export PYTHONPATH := $(VENV_SITE_PACKAGES):$(CURDIR)/nanovllm_rs/python
+
+# WSL exposes two libcuda.so.1: a real Linux driver copy (pulled in by nvidia-cuda-toolkit,
+# talks to a nonexistent /dev/nvidia0) and the WSL passthrough shim in /usr/lib/wsl/lib (talks
+# to the Windows host driver via /dev/dxg). It must resolve first or CUDA calls report no device.
+export LD_LIBRARY_PATH := /usr/lib/wsl/lib:$(CURDIR)/.nccl_lib:$(UV_PYTHON_HOME)/lib:$(LD_LIBRARY_PATH)
 
 MODEL ?= Qwen/Qwen3-0.6B
 MODEL_DIR := models/$(MODEL)
@@ -18,11 +38,14 @@ HOST ?= localhost
 PROMPT ?= The capital of France is
 MAX_TOKENS ?= 64
 TEMPERATURE ?= 1.0
+GPU_MEMORY_UTILIZATION ?= 0.9
+# Default (16384) sizes the KV-cache profiling forward pass's peak activation memory; on a
+# 4GB card that peak alone can exceed the whole memory budget regardless of utilization.
+MAX_NUM_BATCHED_TOKENS ?= 2048
 
 install-python:
-	uv pip install --system -e nanovllm_rs/python --extra-index-url https://download.pytorch.org/whl/cu128
-	chmod -R a+rX /usr/local/lib/python3.10/dist-packages 2>/dev/null || \
-		sudo chmod -R a+rX /usr/local/lib/python3.10/dist-packages
+	uv venv --python 3.10 $(VENV_DIR)
+	uv pip install --python $(VENV_DIR)/bin/python -e nanovllm_rs/python --extra-index-url https://download.pytorch.org/whl/cu128
 
 nccl-lib:
 	mkdir -p .nccl_lib
@@ -35,8 +58,10 @@ download-model:
 	fi
 
 serve: download-model nccl-lib
-	cargo run --manifest-path nanovllm_rs/Cargo.toml --features cuda --bin serve -- \
-		$(MODEL_DIR) --tensor-parallel-size $(TP_SIZE) --port $(PORT)
+	cargo run --release --manifest-path nanovllm_rs/Cargo.toml --features cuda --bin serve -- \
+		$(MODEL_DIR) --tensor-parallel-size $(TP_SIZE) --port $(PORT) \
+		--gpu-memory-utilization $(GPU_MEMORY_UTILIZATION) \
+		--max-num-batched-tokens $(MAX_NUM_BATCHED_TOKENS)
 
 generate:
 	curl -s -X POST http://$(HOST):$(PORT)/generate \

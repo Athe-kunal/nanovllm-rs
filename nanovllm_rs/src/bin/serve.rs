@@ -30,6 +30,7 @@ struct Args {
     tensor_parallel_size: usize,
     port: u16,
     max_num_batched_tokens: Option<usize>,
+    gpu_memory_utilization: Option<f64>,
 }
 
 fn parse_args() -> Args {
@@ -37,6 +38,7 @@ fn parse_args() -> Args {
     let mut tensor_parallel_size = 1usize;
     let mut port = 8000u16;
     let mut max_num_batched_tokens = None;
+    let mut gpu_memory_utilization = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -54,6 +56,11 @@ fn parse_args() -> Args {
                 max_num_batched_tokens =
                     Some(value.parse().expect("--max-num-batched-tokens must be a positive integer"));
             }
+            "--gpu-memory-utilization" => {
+                let value = args.next().expect("--gpu-memory-utilization requires a value");
+                gpu_memory_utilization =
+                    Some(value.parse().expect("--gpu-memory-utilization must be a float between 0 and 1"));
+            }
             "--model" => {
                 model_path = Some(args.next().expect("--model requires a value"));
             }
@@ -66,6 +73,7 @@ fn parse_args() -> Args {
         tensor_parallel_size,
         port,
         max_num_batched_tokens,
+        gpu_memory_utilization,
     }
 }
 
@@ -236,6 +244,9 @@ async fn main() {
     };
     if let Some(max_num_batched_tokens) = args.max_num_batched_tokens {
         engine_config.max_num_batched_tokens = max_num_batched_tokens;
+    }
+    if let Some(gpu_memory_utilization) = args.gpu_memory_utilization {
+        engine_config.gpu_memory_utilization = gpu_memory_utilization;
     }
 
     let chat_env = Arc::new(load_chat_env(&engine_config.model_path));

@@ -4,7 +4,7 @@ prompts = ["What is the capital of France?", "What is the capital of Japan?", "W
 
 async def generate(client, prompt):
     r = await client.post("http://localhost:8000/generate",
-                           json={"prompt": prompt, "max_tokens": 1024})
+                           json={"prompt": prompt, "max_tokens": 256})
     return r.json()
 
 async def main():
