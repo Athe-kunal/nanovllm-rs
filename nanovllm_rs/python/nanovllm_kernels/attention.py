@@ -5,6 +5,17 @@ from torch.utils.dlpack import from_dlpack
 
 from flash_attn import flash_attn_varlen_func
 
+_external_streams: dict = {}  # reuse one Stream object per (stream_ptr, device)
+
+
+def _external_stream(stream_ptr: int, device) -> torch.cuda.Stream:
+    key = (stream_ptr, device)
+    s = _external_streams.get(key)
+    if s is None:
+        s = torch.cuda.ExternalStream(stream_ptr, device=device)
+        _external_streams[key] = s
+    return s
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -39,6 +50,21 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
+def store_kvcache_external_stream(key, value, k_cache, v_cache, slot_mapping):
+    """Same effect as `store_kvcache`, but pure torch indexing instead of the Triton kernel.
+    The Triton kernel does not respect the `torch.cuda.stream(ExternalStream(...))` context
+    used in `flash_attn_varlen_dlpack` below — it silently writes wrong data (confirmed by
+    comparing decode output against the host path), so it must not be used under an
+    ExternalStream. Regular torch ops don't have this problem."""
+    n, d = key.shape[0], key.shape[1] * key.shape[2]
+    valid = slot_mapping >= 0
+    if not torch.any(valid):
+        return
+    idx = slot_mapping[valid].long()
+    k_cache.view(-1, d)[idx] = key.reshape(n, d)[valid]
+    v_cache.view(-1, d)[idx] = value.reshape(n, d)[valid]
+
+
 def flash_attn_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -67,16 +93,25 @@ def flash_attn_varlen_dlpack(
     stream_ptr: int = 0,
 ):
     """Zero-copy attention: q/k/v/out and the index tensors are candle-owned GPU buffers
-    wrapped via DLPack (no device<->host copy). Everything runs on candle's stream so the
-    handoff needs no synchronization, and the flash-attn result is written straight back into
-    candle's pre-allocated `out` buffer. Mirrors Attention::forward's host path exactly."""
+    wrapped via DLPack (no device<->host copy), written back into candle's pre-allocated
+    `out` buffer. Everything runs on candle's own stream via ExternalStream, so no sync is
+    needed to order or fetch the result.
+
+    Two bugs had to be fixed to get here: the Triton store_kvcache kernel silently ignores
+    the `torch.cuda.stream(ExternalStream(...))` context (see store_kvcache_external_stream);
+    and candle's device, when created via `Device::cuda_if_available`, runs on cudarc's
+    NULL/legacy-default stream (raw pointer 0x0) rather than a real dedicated stream — wrapping
+    that as an ExternalStream is not a well-behaved case for torch (intermittent corruption,
+    inconsistent across process launches, that no amount of added synchronization fixed). The
+    Rust side must construct its device with `Device::new_cuda_with_stream` for this bridge to
+    be reliable."""
     q = from_dlpack(q)
     # Bind the ExternalStream to *this rank's* device explicitly. Under tensor parallelism
     # rank r runs on GPU r with its own candle stream; defaulting the stream's device (and
     # thus leaving torch's kernels on the wrong device's default stream) races against candle's
     # producing ops and NCCL collectives, silently corrupting rank>0 output.
     device = q.device
-    stream = torch.cuda.ExternalStream(stream_ptr, device=device)
+    stream = _external_stream(stream_ptr, device)
     with torch.cuda.device(device), torch.cuda.stream(stream):
         k = from_dlpack(k)
         v = from_dlpack(v)
@@ -86,7 +121,7 @@ def flash_attn_varlen_dlpack(
         cu_seqlens_k = from_dlpack(cu_seqlens_k).to(torch.int32)
 
         if slot_mapping is not None and k_cache is not None and v_cache is not None:
-            store_kvcache(k, v, k_cache, v_cache, from_dlpack(slot_mapping).to(torch.int32))
+            store_kvcache_external_stream(k, v, k_cache, v_cache, from_dlpack(slot_mapping).to(torch.int32))
 
         if block_table is not None:
             block_table = from_dlpack(block_table).to(torch.int32)

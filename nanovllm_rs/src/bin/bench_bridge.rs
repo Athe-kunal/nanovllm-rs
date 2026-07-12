@@ -38,7 +38,7 @@ fn dlpack_roundtrip(py: Python<'_>, kernels: &Bound<'_, PyModule>, t: &Tensor, o
 fn main() {
     let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
 
-    let dev = Device::cuda_if_available(0).expect("cuda device");
+    let dev = Device::new_cuda_with_stream(0).expect("cuda device");
     Python::with_gil(|py| pybridge::set_cuda_device(py, 0)).expect("set torch device");
     let stream = dlpack::stream_ptr(&dev).expect("stream ptr");
 

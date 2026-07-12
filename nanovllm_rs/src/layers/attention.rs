@@ -4,16 +4,14 @@ use pyo3::prelude::*;
 use crate::utils::context::get_context;
 use crate::utils::pybridge;
 
-/// Selects the zero-copy DLPack bridge. On by default at `tp_size == 1`: correct and
-/// ~1.4-1.5x faster end-to-end than the host round-trip (bit-identical greedy output to it),
-/// so there's no reason to pay the host path's cost there. `NANOVLLM_DLPACK=0`/`false` is
-/// kept as an explicit kill-switch back to the host path, for debugging or A/B comparison.
+/// Selects the zero-copy DLPack bridge. On by default at `tp_size == 1`: verified correct
+/// (matches the host path) and faster, across repeated fresh process launches, once two real
+/// bugs were fixed — see `flash_attn_varlen_dlpack`'s docstring in `attention.py`, and
+/// `Device::new_cuda_with_stream` in `model_runner.rs`. `NANOVLLM_DLPACK=0`/`false` is kept
+/// as an explicit kill-switch back to the host path.
 ///
-/// Hard-gated off (regardless of the env var) whenever `tp_size > 1`: DLPack currently has a
-/// non-deterministic cross-rank race under TP>1 (output occasionally diverges mid-decode) that
-/// a per-call device sync does NOT fix — the host path's implicit per-layer syncing was
-/// masking a deeper ordering assumption in the TP collectives. That's still unresolved, so a
-/// TP>1 deployment must never be able to reach this path no matter how the env var is set.
+/// Hard-gated off at `tp_size > 1` regardless of the env var: separate, still-unresolved
+/// cross-rank race there (untested on this box — no second GPU available).
 #[cfg(feature = "cuda")]
 fn dlpack_enabled(tp_size: usize) -> bool {
     if tp_size > 1 {
@@ -167,12 +165,12 @@ impl Attention {
     }
 
     /// Zero-copy bridge: q/k/v, the index tensors, and a pre-allocated `out` buffer are all
-    /// candle-owned GPU memory handed to torch via DLPack — no host round trip, no f32 detour.
-    /// The torch kernels run on candle's stream and write the result straight into `out`, so
-    /// no host sync is needed to order or fetch the result. Same GIL discipline as the host
-    /// path: `to_dlpack` only reads pointers/metadata (no candle-stream sync), and every
-    /// device op stays on the one stream, so the GIL is never held across an NCCL-dependent
-    /// sync. Enabled by NANOVLLM_DLPACK=1.
+    /// candle-owned GPU memory handed to torch via DLPack — no host round trip, no f32 detour,
+    /// no synchronization (see `flash_attn_varlen_dlpack`'s docstring in attention.py — this
+    /// requires the device to have been built with `Device::new_cuda_with_stream`, not
+    /// `cuda_if_available`). Same GIL discipline as the host path: `to_dlpack` only reads
+    /// pointers/metadata (no candle-stream sync), and every device op stays on the one stream,
+    /// so the GIL is never held across an NCCL-dependent sync.
     #[cfg(feature = "cuda")]
     fn forward_dlpack(&mut self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         use crate::utils::dlpack;

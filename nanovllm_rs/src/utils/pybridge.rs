@@ -26,9 +26,8 @@ pub fn kernels_module(py: Python<'_>) -> Result<Bound<'_, PyModule>> {
     Ok(m)
 }
 
-/// Resolves `nanovllm_kernels.<name>` once per process and reuses the bound callable on every
-/// later call (`clone_ref` is a refcount bump, not a lookup) — avoids re-doing the
-/// string-keyed `getattr` dict lookup on every layer, every forward pass.
+/// Resolves `nanovllm_kernels.<name>` once and reuses the handle instead of a fresh
+/// `getattr` on every call.
 fn cached_fn(py: Python<'_>, cell: &'static OnceLock<Py<PyAny>>, name: &str) -> Result<Py<PyAny>> {
     if let Some(f) = cell.get() {
         return Ok(f.clone_ref(py));

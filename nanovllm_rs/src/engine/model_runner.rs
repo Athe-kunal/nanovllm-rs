@@ -37,7 +37,10 @@ impl ModelRunner {
     /// since under TP the block count must be reconciled across ranks first.
     pub fn new(config: &Config, engine_config: &EngineConfig, rank: usize, comm: Option<Arc<Comm>>) -> Self {
         Python::with_gil(|py| pybridge::set_cuda_device(py, rank)).expect("failed to set cuda device");
-        let device = Device::cuda_if_available(rank).expect("failed to create device");
+        // cuda_if_available() creates a CudaDevice on cudarc's NULL/legacy default stream
+        // (raw pointer 0x0), which torch.cuda.ExternalStream is not well-behaved for — using
+        // new_cuda_with_stream() gets a genuine non-default stream to hand to the DLPack bridge.
+        let device = Device::new_cuda_with_stream(rank).expect("failed to create device");
         let mut model = Qwen3ForCausalLM::new(config, comm, &device).expect("failed to build model");
         loader::load_model(&mut model, &engine_config.model_path, &device).expect("failed to load model weights");
         model.tie_weights_if_configured();
