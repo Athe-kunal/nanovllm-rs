@@ -90,7 +90,7 @@ impl Qwen3Attention{
             device,
         )?;
         let rotary_emb = RotaryEmbedding::new(head_dim, head_dim, max_position, rope_theta, device)?;
-        let attn = Attention::new(num_heads, head_dim, scaling, num_kv_heads);
+        let attn = Attention::new(num_heads, head_dim, scaling, num_kv_heads, tp_size);
 
         let (q_norm, k_norm) = if !qkv_bias {
             (

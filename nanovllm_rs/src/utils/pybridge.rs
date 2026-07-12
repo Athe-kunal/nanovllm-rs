@@ -26,6 +26,49 @@ pub fn kernels_module(py: Python<'_>) -> Result<Bound<'_, PyModule>> {
     Ok(m)
 }
 
+/// Resolves `nanovllm_kernels.<name>` once per process and reuses the bound callable on every
+/// later call (`clone_ref` is a refcount bump, not a lookup) — avoids re-doing the
+/// string-keyed `getattr` dict lookup on every layer, every forward pass.
+fn cached_fn(py: Python<'_>, cell: &'static OnceLock<Py<PyAny>>, name: &str) -> Result<Py<PyAny>> {
+    if let Some(f) = cell.get() {
+        return Ok(f.clone_ref(py));
+    }
+    let f = kernels_module(py)?.getattr(name).map_err(candle_core::Error::wrap)?.unbind();
+    let _ = cell.set(f.clone_ref(py));
+    Ok(f)
+}
+
+pub fn to_cuda_tensor_fn(py: Python<'_>) -> Result<Py<PyAny>> {
+    static CELL: OnceLock<Py<PyAny>> = OnceLock::new();
+    cached_fn(py, &CELL, "to_cuda_tensor")
+}
+
+pub fn to_cuda_int32_tensor_fn(py: Python<'_>) -> Result<Py<PyAny>> {
+    static CELL: OnceLock<Py<PyAny>> = OnceLock::new();
+    cached_fn(py, &CELL, "to_cuda_int32_tensor")
+}
+
+pub fn to_host_array_fn(py: Python<'_>) -> Result<Py<PyAny>> {
+    static CELL: OnceLock<Py<PyAny>> = OnceLock::new();
+    cached_fn(py, &CELL, "to_host_array")
+}
+
+pub fn store_kvcache_fn(py: Python<'_>) -> Result<Py<PyAny>> {
+    static CELL: OnceLock<Py<PyAny>> = OnceLock::new();
+    cached_fn(py, &CELL, "store_kvcache")
+}
+
+pub fn flash_attn_varlen_fn(py: Python<'_>) -> Result<Py<PyAny>> {
+    static CELL: OnceLock<Py<PyAny>> = OnceLock::new();
+    cached_fn(py, &CELL, "flash_attn_varlen")
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_attn_varlen_dlpack_fn(py: Python<'_>) -> Result<Py<PyAny>> {
+    static CELL: OnceLock<Py<PyAny>> = OnceLock::new();
+    cached_fn(py, &CELL, "flash_attn_varlen_dlpack")
+}
+
 // The candle<->torch tensor bridge is deliberately split into a candle half (host copy,
 // no GIL) and a Python half (GIL held). Under tensor parallelism a candle device->host or
 // host->device copy syncs the candle CUDA stream, which may be blocked on a pending
@@ -45,12 +88,9 @@ pub fn tensor_to_host(t: &Tensor) -> Result<(Vec<f32>, Vec<i64>, DType)> {
 
 /// Builds a CUDA `torch.Tensor` from host f32 data, preserving dtype and shape (GIL held).
 pub fn host_to_torch(py: Python<'_>, data: Vec<f32>, dims: Vec<i64>, dtype: DType) -> Result<Py<PyAny>> {
-    let kernels = kernels_module(py)?;
     let arr = PyArray1::from_vec(py, data);
-    kernels
-        .getattr("to_cuda_tensor")
-        .and_then(|f| f.call1((arr, dims, torch_dtype_str(dtype))))
-        .map(Bound::unbind)
+    to_cuda_tensor_fn(py)?
+        .call1(py, (arr, dims, torch_dtype_str(dtype)))
         .map_err(candle_core::Error::wrap)
 }
 
@@ -64,13 +104,8 @@ pub fn index_tensor_to_host(t: &Tensor) -> Result<(Vec<i64>, Vec<i64>)> {
 
 /// Builds a CUDA `torch.int32` tensor from host i64 index data (GIL held).
 pub fn host_to_torch_int32(py: Python<'_>, data: Vec<i64>, dims: Vec<i64>) -> Result<Py<PyAny>> {
-    let kernels = kernels_module(py)?;
     let arr = PyArray1::from_vec(py, data);
-    kernels
-        .getattr("to_cuda_int32_tensor")
-        .and_then(|f| f.call1((arr, dims)))
-        .map(Bound::unbind)
-        .map_err(candle_core::Error::wrap)
+    to_cuda_int32_tensor_fn(py)?.call1(py, (arr, dims)).map_err(candle_core::Error::wrap)
 }
 
 /// Allocates the paged KV cache directly on the CUDA device (one `(k_cache, v_cache)`
@@ -166,13 +201,9 @@ pub fn cuda_synchronize(py: Python<'_>) -> Result<()> {
 /// here runs on torch's stream, which never carries NCCL collectives, so it is safe to hold
 /// the GIL across it (unlike the candle-side copies above).
 pub fn torch_to_host(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<(Vec<f32>, Vec<usize>)> {
-    let kernels = kernels_module(py)?;
-    let host_array = kernels
-        .getattr("to_host_array")
-        .and_then(|f| f.call1((obj,)))
-        .map_err(candle_core::Error::wrap)?;
+    let host_array = to_host_array_fn(py)?.call1(py, (obj,)).map_err(candle_core::Error::wrap)?;
     let host_array: PyReadonlyArrayDyn<f32> =
-        host_array.extract().map_err(candle_core::Error::wrap)?;
+        host_array.bind(py).extract().map_err(candle_core::Error::wrap)?;
 
     let shape = host_array.shape().to_vec();
     let data = host_array

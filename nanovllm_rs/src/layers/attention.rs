@@ -4,20 +4,27 @@ use pyo3::prelude::*;
 use crate::utils::context::get_context;
 use crate::utils::pybridge;
 
-/// Selects the zero-copy DLPack bridge when `NANOVLLM_DLPACK=1`. Off by default so the
-/// battle-tested host round-trip stays the fallback; set it to opt into the faster path.
+/// Selects the zero-copy DLPack bridge. On by default at `tp_size == 1`: correct and
+/// ~1.4-1.5x faster end-to-end than the host round-trip (bit-identical greedy output to it),
+/// so there's no reason to pay the host path's cost there. `NANOVLLM_DLPACK=0`/`false` is
+/// kept as an explicit kill-switch back to the host path, for debugging or A/B comparison.
 ///
-/// Status: correct and ~1.4-1.5x faster end-to-end at TP=1 (bit-identical greedy output to
-/// the host path). Under TP>1 it currently has a non-deterministic cross-rank race (output
-/// occasionally diverges mid-decode) that a per-call device sync does NOT fix — the host
-/// path's implicit per-layer syncing was masking a deeper ordering assumption in the TP
-/// collectives. Keep this off for TP>1 until that's root-caused.
+/// Hard-gated off (regardless of the env var) whenever `tp_size > 1`: DLPack currently has a
+/// non-deterministic cross-rank race under TP>1 (output occasionally diverges mid-decode) that
+/// a per-call device sync does NOT fix — the host path's implicit per-layer syncing was
+/// masking a deeper ordering assumption in the TP collectives. That's still unresolved, so a
+/// TP>1 deployment must never be able to reach this path no matter how the env var is set.
 #[cfg(feature = "cuda")]
-fn dlpack_enabled() -> bool {
+fn dlpack_enabled(tp_size: usize) -> bool {
+    if tp_size > 1 {
+        return false;
+    }
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NANOVLLM_DLPACK").map(|v| v == "1" || v == "true").unwrap_or(false)
+        std::env::var("NANOVLLM_DLPACK")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
     })
 }
 
@@ -26,17 +33,19 @@ pub struct Attention {
     head_dim: usize,
     scale: f32,
     num_kv_heads: usize,
+    tp_size: usize,
     k_cache: Option<Py<PyAny>>,
     v_cache: Option<Py<PyAny>>,
 }
 
 impl Attention {
-    pub fn new(num_heads: usize, head_dim: usize, scale: f32, num_kv_heads: usize) -> Self {
+    pub fn new(num_heads: usize, head_dim: usize, scale: f32, num_kv_heads: usize, tp_size: usize) -> Self {
         Self {
             num_heads,
             head_dim,
             scale,
             num_kv_heads,
+            tp_size,
             k_cache: None,
             v_cache: None,
         }
@@ -49,7 +58,7 @@ impl Attention {
 
     pub fn forward(&mut self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
-        if dlpack_enabled() {
+        if dlpack_enabled(self.tp_size) {
             return self.forward_dlpack(q, k, v);
         }
         self.forward_host(q, k, v)
@@ -102,8 +111,6 @@ impl Attention {
         // kernels, and pull the result back to host. Every copy here is on torch's stream,
         // which carries no NCCL work, so syncing under the GIL cannot deadlock.
         let (out_data, out_shape) = Python::with_gil(|py| -> Result<(Vec<f32>, Vec<usize>)> {
-            let kernels = pybridge::kernels_module(py)?;
-
             let py_q = pybridge::host_to_torch(py, q_data, q_dims, q_dtype)?;
             let py_k = pybridge::host_to_torch(py, k_data, k_dims, k_dtype)?;
             let py_v = pybridge::host_to_torch(py, v_data, v_dims, v_dtype)?;
@@ -112,9 +119,8 @@ impl Attention {
                 (&self.k_cache, &self.v_cache, slot_mapping_host)
             {
                 let py_slot_mapping = pybridge::host_to_torch_int32(py, sm_data, sm_dims)?;
-                kernels
-                    .getattr("store_kvcache")
-                    .and_then(|f| f.call1((&py_k, &py_v, k_cache, v_cache, py_slot_mapping)))
+                pybridge::store_kvcache_fn(py)?
+                    .call1(py, (&py_k, &py_v, k_cache, v_cache, py_slot_mapping))
                     .map_err(candle_core::Error::wrap)?;
             }
 
@@ -135,10 +141,10 @@ impl Attention {
                 .map(|(bt_data, bt_dims)| pybridge::host_to_torch_int32(py, bt_data, bt_dims))
                 .transpose()?;
 
-            let py_out = kernels
-                .getattr("flash_attn_varlen")
-                .and_then(|f| {
-                    f.call1((
+            let py_out = pybridge::flash_attn_varlen_fn(py)?
+                .call1(
+                    py,
+                    (
                         &py_q,
                         attn_k,
                         attn_v,
@@ -149,11 +155,11 @@ impl Attention {
                         self.scale,
                         true,
                         py_block_table,
-                    ))
-                })
+                    ),
+                )
                 .map_err(candle_core::Error::wrap)?;
 
-            pybridge::torch_to_host(py, &py_out)
+            pybridge::torch_to_host(py, py_out.bind(py))
         })?;
 
         // Phase 3 (no GIL): rebuild the candle output tensor (host->device on candle's stream).
@@ -198,7 +204,6 @@ impl Attention {
         let has_kv_cache = self.k_cache.is_some() && self.v_cache.is_some();
 
         Python::with_gil(|py| -> Result<()> {
-            let kernels = pybridge::kernels_module(py)?;
             let kwargs = PyDict::new(py);
 
             let set = |kwargs: &Bound<'_, PyDict>, key: &str, val: Py<PyAny>| -> Result<()> {
@@ -237,9 +242,8 @@ impl Attention {
             kwargs.set_item("softmax_scale", self.scale).map_err(candle_core::Error::wrap)?;
             kwargs.set_item("stream_ptr", stream).map_err(candle_core::Error::wrap)?;
 
-            kernels
-                .getattr("flash_attn_varlen_dlpack")
-                .and_then(|f| f.call((), Some(&kwargs)))
+            pybridge::flash_attn_varlen_dlpack_fn(py)?
+                .call(py, (), Some(&kwargs))
                 .map_err(candle_core::Error::wrap)?;
             Ok(())
         })?;
