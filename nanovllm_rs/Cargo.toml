@@ -21,3 +21,8 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [features]
 cuda = ["candle-core/cuda", "dep:candle-flash-attn"]
+
+[[bin]]
+name = "repro"
+path = "src/bin/repro.rs"
+required-features = ["cuda"]

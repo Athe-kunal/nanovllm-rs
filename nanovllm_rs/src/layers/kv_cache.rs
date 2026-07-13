@@ -2,11 +2,14 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CudaStorage, DType, InplaceOp3, Layout, Result, Tensor};
 use cudarc::driver::{CudaFunction, CudaModule, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::{compile_ptx, Ptx};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
 use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
 
 const KERNEL_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
 extern "C" __global__ void store_kvcache_bf16(
     const __nv_bfloat16* __restrict__ src,
     __nv_bfloat16* __restrict__ dst,
@@ -36,7 +39,20 @@ extern "C" __global__ void store_kvcache_f16(
 
 fn ptx() -> &'static Ptx {
     static PTX: OnceLock<Ptx> = OnceLock::new();
-    PTX.get_or_init(|| compile_ptx(KERNEL_SRC).expect("failed to compile store_kvcache kernel"))
+    PTX.get_or_init(|| {
+        // NVRTC (unlike nvcc) doesn't know its own toolkit's install location, so
+        // cuda_fp16.h/cuda_bf16.h need an explicit include path.
+        let cuda_root =
+            std::env::var("CUDA_PATH").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+        let opts = CompileOptions {
+            include_paths: vec![
+                format!("{cuda_root}/include"),
+                format!("{cuda_root}/targets/x86_64-linux/include"),
+            ],
+            ..Default::default()
+        };
+        compile_ptx_with_opts(KERNEL_SRC, opts).expect("failed to compile store_kvcache kernel")
+    })
 }
 
 thread_local! {
@@ -97,10 +113,13 @@ impl InplaceOp3 for StoreKvCache {
         }
         let num_tokens = src_l.dims()[0];
         let d: usize = src_l.dims()[1..].iter().product();
-        if cache_l.dims()[1..].iter().product::<usize>() != d {
+        // cache shape is (num_blocks, block_size, num_kv_heads, head_dim); the per-slot width
+        // that must match src's per-token width (num_kv_heads * head_dim) excludes both of the
+        // first two dims, not just num_blocks.
+        if cache_l.dims()[2..].iter().product::<usize>() != d {
             candle_core::bail!(
                 "store_kvcache: cache per-slot width {:?} does not match src width {d}",
-                &cache_l.dims()[1..]
+                &cache_l.dims()[2..]
             );
         }
         if num_tokens == 0 {

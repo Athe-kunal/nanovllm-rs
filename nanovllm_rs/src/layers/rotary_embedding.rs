@@ -1,4 +1,4 @@
-use candle_core::{D, DType, Device, Result, Tensor};
+use candle_core::{IndexOp, D, DType, Device, Result, Tensor};
 
 pub struct RotaryEmbedding{
     head_size: usize,
@@ -62,6 +62,16 @@ impl RotaryEmbedding{
         let half = last_dim / 2;
         let cos = cos_sin.narrow(D::Minus1, 0, half)?;
         let sin = cos_sin.narrow(D::Minus1, half, half)?;
+
+        if std::env::var("NANOVLLM_DEBUG_ROPE").is_ok() {
+            let pos: Vec<i64> = positions.to_dtype(DType::I64)?.flatten_all()?.to_vec1()?;
+            let cos0: Vec<f32> = cos.i(0)?.i(0)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let sin0: Vec<f32> = sin.i(0)?.i(0)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            eprintln!(
+                "[rope-debug] positions={pos:?} cos[..3]={:?} sin[..3]={:?}",
+                &cos0[..3], &sin0[..3]
+            );
+        }
 
         let query = apply_rotary_emb(query, &cos, &sin)?;
         let key = apply_rotary_emb(key, &cos, &sin)?;

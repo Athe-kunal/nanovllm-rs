@@ -124,6 +124,16 @@ impl Qwen3Attention{
     }
 
     pub fn forward(&mut self, positions: &Tensor, hidden_states: &Tensor) -> Result<Tensor>{
+        let debug = std::env::var("NANOVLLM_DEBUG_STAGES").is_ok();
+        let fp = |label: &str, t: &Tensor| -> Result<()> {
+            if debug {
+                let n = t.dim(0)?;
+                let last = t.narrow(0, n - 1, 1)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                eprintln!("[stage-debug] {label} first3={:?}", &last[..3]);
+            }
+            Ok(())
+        };
+
         let qkv = self.qkv_proj.forward(hidden_states)?;
         let (q,k,v) = split_qkv(&qkv, self.q_size, self.kv_size)?;
         // q = [num_tokens, num_heads, head_dim]
@@ -131,6 +141,8 @@ impl Qwen3Attention{
         let q = q.reshape((num_tokens, self.num_heads, self.head_dim))?;
         let k = k.reshape((num_tokens, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((num_tokens, self.num_kv_heads, self.head_dim))?;
+        fp("raw_q", &q)?;
+        fp("raw_k", &k)?;
         let (q, k) = if !self.qkv_bias {
             let q = self.q_norm.as_ref().unwrap().forward(&q)?;
             let k = self.k_norm.as_ref().unwrap().forward(&k)?;
@@ -138,8 +150,13 @@ impl Qwen3Attention{
         } else {
             (q, k)
         };
+        fp("normed_q", &q)?;
+        fp("normed_k", &k)?;
         let (q, k) = self.rotary_emb.forward(positions, &q, &k)?;
+        fp("roped_q", &q)?;
+        fp("roped_k", &k)?;
         let o = self.attn.forward(&q, &k, &v)?;
+        fp("attn_out", &o)?;
         // o = [num_tokens, num_heads,head_dim]
         let o_flatten = o.reshape((num_tokens, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&o_flatten)
@@ -283,16 +300,36 @@ impl Qwen3Model{
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, positions: &Tensor) -> Result<Tensor> {
+        let debug = std::env::var("NANOVLLM_DEBUG_HIDDEN").is_ok();
+        let fp = |t: &Tensor| -> Result<(f32, f32, f32, Vec<f32>)> {
+            let n = t.dim(0)?;
+            let last = t.narrow(0, n - 1, 1)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let min = last.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = last.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean = last.iter().sum::<f32>() / last.len() as f32;
+            Ok((min, max, mean, last[..3].to_vec()))
+        };
+
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        if debug {
+            eprintln!("[hidden-debug] layer_out=0 {:?}", fp(&hidden_states)?);
+        }
         let mut residual: Option<Tensor> = None;
 
-        for layer in self.layers.iter_mut() {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
             let (hs, res) = layer.forward(positions, hidden_states, residual)?;
             hidden_states = hs;
             residual = Some(res);
+            if debug {
+                let combined = (&hidden_states + &residual.as_ref().unwrap().to_dtype(hidden_states.dtype())?)?;
+                eprintln!("[hidden-debug] layer_out={} {:?}", i + 1, fp(&combined)?);
+            }
         }
 
         let (hidden_states, _) = self.norm.residual_forward(hidden_states, residual.unwrap())?;
+        if debug {
+            eprintln!("[hidden-debug] layer_out=final_norm {:?}", fp(&hidden_states)?);
+        }
         Ok(hidden_states)
     }
 }
@@ -381,12 +418,20 @@ impl ModelWeights for Qwen3ForCausalLM {
                 },
                 "self_attn.o_proj.weight" => layer.self_attn.o_proj.weight_loader(loaded_weight),
                 "self_attn.q_norm.weight" => {
+                    if std::env::var("NANOVLLM_DEBUG_WEIGHTS").is_ok() && idx == 0 {
+                        let v: Vec<f32> = loaded_weight.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1()).unwrap_or_default();
+                        eprintln!("[weights-debug] layer0 q_norm.weight[..3]={:?}", &v[..3.min(v.len())]);
+                    }
                     if let Some(q_norm) = layer.self_attn.q_norm.as_mut() {
                         q_norm.weight_loader(loaded_weight);
                     }
                     Ok(())
                 }
                 "self_attn.k_norm.weight" => {
+                    if std::env::var("NANOVLLM_DEBUG_WEIGHTS").is_ok() && idx == 0 {
+                        let v: Vec<f32> = loaded_weight.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1()).unwrap_or_default();
+                        eprintln!("[weights-debug] layer0 k_norm.weight[..3]={:?}", &v[..3.min(v.len())]);
+                    }
                     if let Some(k_norm) = layer.self_attn.k_norm.as_mut() {
                         k_norm.weight_loader(loaded_weight);
                     }
