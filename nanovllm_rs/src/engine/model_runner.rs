@@ -130,14 +130,6 @@ impl ModelRunner {
             None
         };
 
-        if std::env::var("NANOVLLM_DEBUG_INPUT").is_ok() && !seqs.is_empty() {
-            eprintln!(
-                "[input-debug] input_ids={input_ids:?} positions={positions:?} slot_mapping={slot_mapping:?} \
-                 cu_seqlens_q={cu_seqlens_q:?} cu_seqlens_k={cu_seqlens_k:?} num_cached_tokens={} num_new_tokens={} block_table={:?}",
-                seqs[0].num_cached_tokens, seqs[0].num_new_tokens, seqs[0].block_table,
-            );
-        }
-
         let num_tokens = input_ids.len();
         let input_ids_t = Tensor::from_vec(input_ids, num_tokens, &self.device)?;
         let positions_t = Tensor::from_vec(positions, num_tokens, &self.device)?;
@@ -207,17 +199,6 @@ impl ModelRunner {
         let (input_ids, positions) = self.prepare_model_input(seqs).expect("failed to prepare model input");
         let temperatures = self.prepare_sample(seqs).expect("failed to prepare sample");
         let logits = self.run_model(&input_ids, &positions).expect("model forward failed");
-
-        if std::env::var("NANOVLLM_DEBUG_LOGITS").is_ok() && !seqs.is_empty() {
-            let lf = logits.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
-            if let Ok(lf) = lf {
-                let vocab = lf.len();
-                let mut idx: Vec<usize> = (0..vocab).collect();
-                idx.sort_by(|&a, &b| lf[b].partial_cmp(&lf[a]).unwrap());
-                let top5: Vec<(usize, f32)> = idx[..5.min(vocab)].iter().map(|&i| (i, lf[i])).collect();
-                eprintln!("[logits-debug] shape={:?} top5={:?}", logits.dims(), top5);
-            }
-        }
 
         let token_ids_tensor = self.sampler.forward(logits, temperatures).expect("sampling failed");
         let token_ids: Vec<u32> = token_ids_tensor

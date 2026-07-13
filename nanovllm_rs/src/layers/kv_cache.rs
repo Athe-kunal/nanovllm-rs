@@ -172,8 +172,18 @@ pub fn store_kv_cache(
     v_cache: &Tensor,
     slot_mapping: &Tensor,
 ) -> Result<()> {
-    let key = key.contiguous()?;
-    let value = value.contiguous()?;
+    // `.contiguous()` is a no-op (returns a shared-storage clone) whenever `is_contiguous()`
+    // is true — and `Shape::is_contiguous` skips the stride check entirely for any dimension
+    // of size 1. During decode, `num_tokens == 1`, so key/value are (1, kv_size) narrow-views
+    // into the middle of the fused qkv_proj output buffer: a real offset slice that gets
+    // misclassified as contiguous. `store_kvcache`'s custom kernel launch captures a raw
+    // pointer into that aliased buffer and runs asynchronously, bypassing candle's normal
+    // op-dependency tracking — once the last Rust-side reference to the shared qkv buffer
+    // drops, the allocator can reuse that memory for a later tensor before the kernel has
+    // actually read it, corrupting the cache write. `force_contiguous()` always copies,
+    // closing that gap.
+    let key = key.force_contiguous()?;
+    let value = value.force_contiguous()?;
     k_cache.inplace_op3(&key, slot_mapping, &StoreKvCache)?;
     v_cache.inplace_op3(&value, slot_mapping, &StoreKvCache)?;
     Ok(())
