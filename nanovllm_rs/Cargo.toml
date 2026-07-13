@@ -18,6 +18,7 @@ tokenizers = "0.20"
 indicatif = "0.17"
 minijinja = { version = "2", features = ["json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [features]
 cuda = ["candle-core/cuda", "dep:candle-flash-attn"]
@@ -26,3 +27,7 @@ cuda = ["candle-core/cuda", "dep:candle-flash-attn"]
 name = "repro"
 path = "src/bin/repro.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "test_client"
+path = "src/bin/test_client.rs"

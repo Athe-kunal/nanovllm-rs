@@ -1,4 +1,4 @@
-.PHONY: serve generate download-model
+.PHONY: serve generate download-model test
 
 export PATH := $(HOME)/.cargo/bin:/usr/local/cuda/bin:$(PATH)
 
@@ -42,3 +42,7 @@ generate:
 	curl -s -X POST http://$(HOST):$(PORT)/generate \
 		-H "Content-Type: application/json" \
 		-d '{"prompt": "$(PROMPT)", "max_tokens": $(MAX_TOKENS), "temperature": $(TEMPERATURE)}'
+
+test:
+	cargo run --release --manifest-path nanovllm_rs/Cargo.toml --features cuda --bin test_client -- \
+		--host $(HOST) --port $(PORT)
