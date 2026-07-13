@@ -19,6 +19,10 @@ GPU_MEMORY_UTILIZATION ?= 0.9
 # Default (16384) sizes the KV-cache profiling forward pass's peak activation memory; on a
 # 4GB card that peak alone can exceed the whole memory budget regardless of utilization.
 MAX_NUM_BATCHED_TOKENS ?= 2048
+# `flash-attn` builds real CUDA flash-attention (candle-flash-attn); override with
+# `FEATURES=cuda` to fall back to plain candle_nn attention instead (no candle-flash-attn
+# compilation needed — useful if it doesn't build for your GPU arch/CUDA toolchain).
+FEATURES ?= flash-attn
 
 # download-model only needs huggingface_hub, not a full Python toolchain — a tiny venv just
 # for that, separate from the (now removed) torch/pyo3 bridge the Rust binary used to need.
@@ -33,7 +37,7 @@ download-model:
 	fi
 
 serve: download-model
-	cargo run --release --manifest-path nanovllm_rs/Cargo.toml --features cuda --bin serve -- \
+	cargo run --release --manifest-path nanovllm_rs/Cargo.toml --features $(FEATURES) --bin serve -- \
 		$(MODEL_DIR) --tensor-parallel-size $(TP_SIZE) --port $(PORT) \
 		--gpu-memory-utilization $(GPU_MEMORY_UTILIZATION) \
 		--max-num-batched-tokens $(MAX_NUM_BATCHED_TOKENS)
@@ -44,5 +48,5 @@ generate:
 		-d '{"prompt": "$(PROMPT)", "max_tokens": $(MAX_TOKENS), "temperature": $(TEMPERATURE)}'
 
 test:
-	cargo run --release --manifest-path nanovllm_rs/Cargo.toml --features cuda --bin test_client -- \
+	cargo run --release --manifest-path nanovllm_rs/Cargo.toml --features $(FEATURES) --bin test_client -- \
 		--host $(HOST) --port $(PORT)

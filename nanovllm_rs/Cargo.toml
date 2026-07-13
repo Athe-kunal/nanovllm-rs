@@ -21,12 +21,17 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [features]
-cuda = ["candle-core/cuda", "dep:candle-flash-attn"]
+cuda = ["candle-core/cuda"]
+# Real CUDA flash-attention (including the paged/windowed KV-cache variant). Without this,
+# `cuda` alone still runs on GPU, but attention falls back to plain candle_nn matmul/softmax —
+# slower, but doesn't need candle-flash-attn to compile (e.g. on GPU archs or CUDA toolchains
+# it doesn't support).
+flash-attn = ["cuda", "dep:candle-flash-attn"]
 
 [[bin]]
 name = "repro"
 path = "src/bin/repro.rs"
-required-features = ["cuda"]
+required-features = ["flash-attn"]
 
 [[bin]]
 name = "test_client"

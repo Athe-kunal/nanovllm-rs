@@ -1,20 +1,17 @@
 # nanovllm_rs
 
-A Rust reimplementation of a vLLM-style inference engine, serving models over HTTP with continuous batching.
+A Rust reimplementation of a vLLM-style inference engine, serving models over HTTP with continuous batching. Model execution is pure Rust/candle end to end, with no Python or PyO3 bridge involved in serving. Attention runs through `candle-flash-attn` (native CUDA flash-attention, including a paged/windowed variant for the KV cache) by default, falling back automatically to plain `candle_nn` matmul/softmax attention if that crate isn't built in — see [Attention backend](#attention-backend).
 
 ## Prerequisites
 
 - NVIDIA GPU + driver
 - CUDA toolkit 12.8 (`nvcc`) and a matching host compiler (`g++`)
 - Rust (`rustup`/`cargo`)
-- [`uv`](https://github.com/astral-sh/uv)
-
-Run all `make` commands as the **same user** throughout (don't mix `root` and a regular user) — the Python/Rust toolchains are installed per-user, and switching users mid-setup causes permission and `PATH` errors.
+- [`uv`](https://github.com/astral-sh/uv) — only used to fetch a model from Hugging Face (a throwaway venv with just `huggingface_hub`); the server itself has no Python dependency
 
 ## Setup
 
 ```
-make install-python                          # installs the Python deps (torch, kernels, etc.)
 make download-model MODEL=Qwen/Qwen3-0.6B     # pulls the model from Hugging Face into models/
 make serve                                    # builds and starts the server
 ```
@@ -39,3 +36,26 @@ Or hit the endpoints directly:
 - `POST /chat` — `{"messages": [{"role": str, "content": str}], "max_tokens": int, "temperature": float}` for multi-turn conversations (send the full message history each call)
 
 The server batches concurrent requests together automatically, so multiple clients can hit it at once without waiting in line.
+
+## Attention backend
+
+By default (`make serve`, `make test`), the build enables the `flash-attn` Cargo feature, which
+compiles in `candle-flash-attn` for real fused CUDA flash-attention. If it fails to build for
+your GPU architecture or CUDA toolchain (or you just don't want the extra kernel compilation),
+build with the `cuda` feature alone instead — attention then falls back to plain `candle_nn`
+ops (matmul + softmax, causal masking, GQA), correct but slower:
+
+```
+make serve FEATURES=cuda
+```
+
+This is a compile-time choice, not a runtime one: whichever feature set the binary was built
+with determines which attention path it uses.
+
+## Smoke-testing
+
+```
+make test
+```
+
+Runs a small client (`test_client`) against an already-running server: sends a few prompts over `/generate` and checks the responses come back sane. Point it at a different host/port with `HOST`/`PORT`.
