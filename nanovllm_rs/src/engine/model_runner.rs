@@ -1,5 +1,4 @@
 use candle_core::{DType, Device, Result, Tensor};
-use pyo3::prelude::*;
 use std::sync::Arc;
 
 use crate::config::{Config, EngineConfig};
@@ -10,17 +9,6 @@ use crate::models::qwen3::Qwen3ForCausalLM;
 use crate::sampling_params::SamplingParams;
 use crate::utils::context::{get_context, reset_context, set_context};
 use crate::utils::loader;
-use crate::utils::pybridge;
-
-fn dtype_itemsize(dtype: &str) -> usize {
-    match dtype {
-        "float64" | "int64" => 8,
-        "float32" | "int32" => 4,
-        "float16" | "bfloat16" => 2,
-        "uint8" | "int8" => 1,
-        other => panic!("unsupported torch_dtype: {other}"),
-    }
-}
 
 pub struct ModelRunner {
     config: Config,
@@ -36,10 +24,6 @@ impl ModelRunner {
     /// KV cache is allocated separately via `probe_num_kvcache_blocks`/`finish_setup`,
     /// since under TP the block count must be reconciled across ranks first.
     pub fn new(config: &Config, engine_config: &EngineConfig, rank: usize, comm: Option<Arc<Comm>>) -> Self {
-        Python::with_gil(|py| pybridge::set_cuda_device(py, rank)).expect("failed to set cuda device");
-        // cuda_if_available() creates a CudaDevice on cudarc's NULL/legacy default stream
-        // (raw pointer 0x0), which torch.cuda.ExternalStream is not well-behaved for — using
-        // new_cuda_with_stream() gets a genuine non-default stream to hand to the DLPack bridge.
         let device = Device::new_cuda_with_stream(rank).expect("failed to create device");
         let mut model = Qwen3ForCausalLM::new(config, comm, &device).expect("failed to build model");
         loader::load_model(&mut model, &engine_config.model_path, &device).expect("failed to load model weights");
@@ -71,10 +55,12 @@ impl ModelRunner {
         let mut data = Vec::with_capacity(seqs.len() * max_len);
         for seq in seqs {
             for &b in &seq.block_table {
-                data.push(b as i64);
+                data.push(b as u32);
             }
+            // Padding beyond a sequence's real block count is never read: flash-attn's paged
+            // kernel bounds reads by seqlen_k, not by scanning to the end of a block_table row.
             for _ in seq.block_table.len()..max_len {
-                data.push(-1i64);
+                data.push(0u32);
             }
         }
         Tensor::from_vec(data, (seqs.len(), max_len), &self.device)
@@ -85,8 +71,8 @@ impl ModelRunner {
 
         let mut input_ids: Vec<i64> = Vec::new();
         let mut positions: Vec<i64> = Vec::new();
-        let mut cu_seqlens_q: Vec<i64> = vec![0];
-        let mut cu_seqlens_k: Vec<i64> = vec![0];
+        let mut cu_seqlens_q: Vec<u32> = vec![0];
+        let mut cu_seqlens_k: Vec<u32> = vec![0];
         let mut max_seqlen_q = 0usize;
         let mut max_seqlen_k = 0usize;
         let mut slot_mapping: Vec<i64> = Vec::new();
@@ -109,8 +95,8 @@ impl ModelRunner {
 
             let seqlen_q = seq.num_new_tokens;
             let seqlen_k = num_context_tokens;
-            cu_seqlens_q.push(cu_seqlens_q.last().unwrap() + seqlen_q as i64);
-            cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + seqlen_k as i64);
+            cu_seqlens_q.push(cu_seqlens_q.last().unwrap() + seqlen_q as u32);
+            cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + seqlen_k as u32);
             max_seqlen_q = max_seqlen_q.max(seqlen_q);
             max_seqlen_k = max_seqlen_k.max(seqlen_k);
 
@@ -213,6 +199,7 @@ impl ModelRunner {
         let (input_ids, positions) = self.prepare_model_input(seqs).expect("failed to prepare model input");
         let temperatures = self.prepare_sample(seqs).expect("failed to prepare sample");
         let logits = self.run_model(&input_ids, &positions).expect("model forward failed");
+
         let token_ids_tensor = self.sampler.forward(logits, temperatures).expect("sampling failed");
         let token_ids: Vec<u32> = token_ids_tensor
             .to_dtype(DType::U32)
@@ -238,12 +225,6 @@ impl ModelRunner {
     }
 
     fn warmup_model(&mut self) {
-        let _ = Python::with_gil(|py| -> Result<()> {
-            pybridge::cuda_empty_cache(py)?;
-            pybridge::cuda_reset_peak_memory_stats(py)?;
-            Ok(())
-        });
-
         let max_num_batched_tokens = self.engine_config.max_num_batched_tokens;
         let max_model_len = self.config.max_model_len;
         let num_seqs = (max_num_batched_tokens / max_model_len)
@@ -267,26 +248,27 @@ impl ModelRunner {
         }
 
         let _ = self.run(&mut seqs);
-
-        let _ = Python::with_gil(|py| pybridge::cuda_empty_cache(py));
     }
 
     fn num_kv_heads_per_rank(&self) -> usize {
         self.config.num_key_value_heads / self.engine_config.tensor_parallel_size
     }
 
+    fn cuda_context(&self) -> Arc<cudarc::driver::CudaContext> {
+        match &self.device {
+            Device::Cuda(cd) => cd.cuda_stream().context().clone(),
+            _ => panic!("probe_num_kvcache_blocks requires a CUDA device"),
+        }
+    }
+
     /// Computes the local KV-cache block budget without allocating; under TP the
     /// caller must reconcile (min) across ranks before calling `finish_setup`.
     pub fn probe_num_kvcache_blocks(&self) -> usize {
-        let (free, total) =
-            Python::with_gil(|py| pybridge::cuda_mem_get_info(py)).expect("mem_get_info failed");
-        let used = total - free;
-        let (peak, current) = Python::with_gil(|py| pybridge::cuda_memory_stats_peak_current(py))
-            .expect("memory_stats failed");
+        let (free, total) = self.cuda_context().mem_get_info().expect("mem_get_info failed");
 
         let num_kv_heads = self.num_kv_heads_per_rank();
         let head_dim = self.config.head_dim;
-        let dtype_bytes = dtype_itemsize(&self.config.torch_dtype);
+        let dtype_bytes = self.config.dtype().size_in_bytes();
         let block_bytes = 2
             * self.config.num_hidden_layers
             * self.engine_config.kvcache_block_size
@@ -294,9 +276,8 @@ impl ModelRunner {
             * head_dim
             * dtype_bytes;
 
-        let budget = (total as f64 * self.engine_config.gpu_memory_utilization) as i64 - used as i64
-            - peak as i64
-            + current as i64;
+        let budget = (total as f64 * self.engine_config.gpu_memory_utilization) as i64
+            - (total - free) as i64;
         let num_kvcache_blocks = (budget / block_bytes as i64).max(0) as usize;
         assert!(num_kvcache_blocks > 0, "not enough GPU memory left to allocate the KV cache");
         num_kvcache_blocks
@@ -305,19 +286,17 @@ impl ModelRunner {
     fn allocate_kv_cache(&mut self, num_kvcache_blocks: usize) {
         let num_kv_heads = self.num_kv_heads_per_rank();
         let head_dim = self.config.head_dim;
+        let block_size = self.engine_config.kvcache_block_size;
+        let dtype = self.config.dtype();
+        let shape = (num_kvcache_blocks, block_size, num_kv_heads, head_dim);
 
-        let kv_caches = Python::with_gil(|py| {
-            pybridge::allocate_kv_cache(
-                py,
-                self.config.num_hidden_layers,
-                num_kvcache_blocks,
-                self.engine_config.kvcache_block_size,
-                num_kv_heads,
-                head_dim,
-                self.config.dtype(),
-            )
-        })
-        .expect("failed to allocate kv cache");
+        let kv_caches: Vec<(Tensor, Tensor)> = (0..self.config.num_hidden_layers)
+            .map(|_| {
+                let k = Tensor::zeros(shape, dtype, &self.device).expect("failed to allocate k cache");
+                let v = Tensor::zeros(shape, dtype, &self.device).expect("failed to allocate v cache");
+                (k, v)
+            })
+            .collect();
 
         self.model.set_kv_caches(kv_caches);
         self.num_kvcache_blocks = num_kvcache_blocks;
@@ -328,6 +307,6 @@ impl ModelRunner {
     }
 
     pub fn exit(&mut self) {
-        let _ = Python::with_gil(|py| pybridge::cuda_synchronize(py));
+        let _ = self.cuda_context().synchronize();
     }
 }

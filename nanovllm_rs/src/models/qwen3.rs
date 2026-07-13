@@ -2,7 +2,7 @@ use candle_core::{Device, Result, Tensor, DType, D};
 use crate::layers::nccl::Comm;
 use std::sync::Arc;
 use crate::config::Config;
-use crate::layers::{activation,attention,dist_util,layernorm,linear,embed_head,rotary_embedding};
+use crate::layers::{activation,attention,layernorm,linear,embed_head,rotary_embedding};
 use attention::Attention;
 use layernorm::RMSNorm;
 use linear::{MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear};
@@ -10,7 +10,6 @@ use activation::SiluAndMul;
 use rotary_embedding::RotaryEmbedding;
 use embed_head::{ParallelLMHead, VocabParallelEmbedding};
 use std::collections::HashMap;
-use pyo3::{Py, PyAny};
 use crate::utils::loader::{ModelWeights, ShardId};
 
 pub struct Qwen3Attention{
@@ -90,7 +89,7 @@ impl Qwen3Attention{
             device,
         )?;
         let rotary_emb = RotaryEmbedding::new(head_dim, head_dim, max_position, rope_theta, device)?;
-        let attn = Attention::new(num_heads, head_dim, scaling, num_kv_heads, tp_size);
+        let attn = Attention::new(scaling);
 
         let (q_norm, k_norm) = if !qkv_bias {
             (
@@ -120,7 +119,7 @@ impl Qwen3Attention{
         })
     }
 
-    pub fn set_kv_cache(&mut self, k_cache: Py<PyAny>, v_cache: Py<PyAny>) {
+    pub fn set_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) {
         self.attn.set_kv_cache(k_cache, v_cache);
     }
 
@@ -220,7 +219,7 @@ impl Qwen3DecoderLayer{
         Ok(Self { self_attn, mlp, input_layernorm, post_attention_layernorm })
     }
 
-    pub fn set_kv_cache(&mut self, k_cache: Py<PyAny>, v_cache: Py<PyAny>) {
+    pub fn set_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) {
         self.self_attn.set_kv_cache(k_cache, v_cache);
     }
 
@@ -276,7 +275,7 @@ impl Qwen3Model{
         Ok(Self { embed_tokens, layers, norm })
     }
 
-    pub fn set_kv_caches(&mut self, kv_caches: Vec<(Py<PyAny>, Py<PyAny>)>) {
+    pub fn set_kv_caches(&mut self, kv_caches: Vec<(Tensor, Tensor)>) {
         assert_eq!(kv_caches.len(), self.layers.len());
         for (layer, (k_cache, v_cache)) in self.layers.iter_mut().zip(kv_caches) {
             layer.set_kv_cache(k_cache, v_cache);
@@ -338,7 +337,7 @@ impl Qwen3ForCausalLM{
         }
     }
 
-    pub fn set_kv_caches(&mut self, kv_caches: Vec<(Py<PyAny>, Py<PyAny>)>) {
+    pub fn set_kv_caches(&mut self, kv_caches: Vec<(Tensor, Tensor)>) {
         self.model.set_kv_caches(kv_caches);
     }
 

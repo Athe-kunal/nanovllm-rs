@@ -16,8 +16,11 @@ impl RMSNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor>{
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let x_normed = x.broadcast_div(&(variance + self.eps as f64)?.sqrt()?)?;
+        let orig_dtype = x.dtype();
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let inv_std = (variance + self.eps as f64)?.sqrt()?.recip()?;
+        let x_normed = x_f32.broadcast_mul(&inv_std)?.to_dtype(orig_dtype)?;
         x_normed.broadcast_mul(&self.weight)
     }
 

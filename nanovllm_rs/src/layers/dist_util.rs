@@ -2,8 +2,6 @@ use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::WrapErr;
 use crate::layers::nccl::Comm;
 #[cfg(feature = "cuda")]
 use cudarc::nccl::sys::ncclDataType_t;
@@ -25,7 +23,7 @@ fn cuda_stream(dev: &candle_core::CudaDevice) -> cudarc::nccl::sys::cudaStream_t
     // CUstream (candle's vendored cudarc) and cudaStream_t (this crate's cudarc) are
     // both opaque `*mut CUstream_st` under the hood — same CUDA ABI, different Rust
     // crate instances, so a raw-pointer cast bridges them.
-    (*dev.cuda_device().cu_stream()) as *mut std::ffi::c_void as cudarc::nccl::sys::cudaStream_t
+    dev.cuda_stream().cu_stream() as *mut std::ffi::c_void as cudarc::nccl::sys::cudaStream_t
 }
 
 pub struct AllReduce {
@@ -48,10 +46,11 @@ impl CustomOp1 for AllReduce {
     fn cuda_fwd(&self, s: &candle_core::CudaStorage, l: &Layout) -> Result<(candle_core::CudaStorage, Shape)> {
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
+        let candle_stream = dev.cuda_stream();
         // Unlike every other candle CUDA op, this raw NCCL call bypasses candle's own launch
         // path (which always rebinds the context before a kernel), so without this the thread's
         // current CUDA context can be left pointing at a different rank's device.
-        dev.cuda_device().bind_to_thread().map_err(candle_core::Error::wrap)?;
+        candle_stream.context().bind_to_thread().map_err(candle_core::Error::wrap)?;
         let dtype = nccl_dtype(s.dtype())?;
         let stream = cuda_stream(&dev);
 
@@ -62,10 +61,12 @@ impl CustomOp1 for AllReduce {
                     Some((0, len)) if len == elem_count => src,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<$t>(elem_count) }.w()?;
-                let send_ptr = *src.device_ptr();
-                let recv_ptr = *dst.device_ptr_mut();
+                let mut dst = unsafe { dev.alloc::<$t>(elem_count) }?;
+                let (send_ptr, send_guard) = src.device_ptr(&candle_stream);
+                let (recv_ptr, recv_guard) = dst.device_ptr_mut(&candle_stream);
                 unsafe { self.comm.all_reduce_sum_raw(send_ptr, recv_ptr, elem_count, dtype, stream) }?;
+                drop(send_guard);
+                drop(recv_guard);
                 candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
             }};
         }
@@ -103,7 +104,8 @@ impl CustomOp1 for AllGather {
         let world_size = self.comm.world_size();
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
-        dev.cuda_device().bind_to_thread().map_err(candle_core::Error::wrap)?;
+        let candle_stream = dev.cuda_stream();
+        candle_stream.context().bind_to_thread().map_err(candle_core::Error::wrap)?;
         let dtype = nccl_dtype(s.dtype())?;
         let stream = cuda_stream(&dev);
 
@@ -114,10 +116,12 @@ impl CustomOp1 for AllGather {
                     Some((0, len)) if len == elem_count => src,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<$t>(elem_count * world_size) }.w()?;
-                let send_ptr = *src.device_ptr();
-                let recv_ptr = *dst.device_ptr_mut();
+                let mut dst = unsafe { dev.alloc::<$t>(elem_count * world_size) }?;
+                let (send_ptr, send_guard) = src.device_ptr(&candle_stream);
+                let (recv_ptr, recv_guard) = dst.device_ptr_mut(&candle_stream);
                 unsafe { self.comm.all_gather_raw(send_ptr, recv_ptr, elem_count, dtype, stream) }?;
+                drop(send_guard);
+                drop(recv_guard);
                 candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
             }};
         }
