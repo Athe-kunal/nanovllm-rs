@@ -60,7 +60,6 @@ impl BlockManager{
         for &t in token_ids{
             hasher.update(&t.to_le_bytes());
         }
-        // return the hash value
         hasher.digest() as i64
     }
 

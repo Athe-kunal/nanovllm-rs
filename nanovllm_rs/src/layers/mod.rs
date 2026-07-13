@@ -7,3 +7,5 @@ pub mod embed_head;
 pub mod dist_util;
 pub mod linear;
 pub mod nccl;
+#[cfg(feature = "cuda")]
+pub mod kv_cache;
